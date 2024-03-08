@@ -1,0 +1,1886 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+
+```{r}
+
+library(foreach)
+library(doParallel)
+library(caret)
+library(glmnet)
+```
+# Generate Data Functions 
+```{r}
+generateAndSplit <- function(n.target, p, s, sig.strength, splitRatio = 0.5, R) {
+  library(caret)
+  
+  # Initialize lists for target, train, and valid datasets
+  target <- list(x = NULL, y = NULL)
+  train <- list(x = NULL, y = NULL)
+  valid <- list(x = NULL, y = NULL)
+  
+  # Generate synthetic data matrix
+  target$x <- matrix(rnorm(n.target * p), nrow = n.target) %*% R
+  pr <- 1 / (1 + exp(-target$x %*% c(rep(sig.strength, s), rep(0, p - s))))
+  target$y <- sapply(1:n.target, function(i) sample(0:1, size = 1, prob = c(1 - pr[i], pr[i])))
+  
+  # Set seed for reproducibility
+  set.seed(123)
+  
+  # Create folds for stratified sampling
+  folds <- createFolds(target$y, k = 1/splitRatio, list = TRUE, returnTrain = TRUE)
+  
+  # Using only the first fold for simplicity if you need a single split
+  trainIndices <- folds[[1]]
+  validIndices <- setdiff(1:n.target, trainIndices)
+  
+  # Create training set
+  train$x <- target$x[trainIndices, ]
+  train$y <- target$y[trainIndices]
+  
+  # Create validation set
+  valid$x <- target$x[validIndices, ]
+  valid$y <- target$y[validIndices]
+  
+  # Return a list containing the training and validation sets
+  return(list(target = train, valid = valid))
+}
+
+
+
+```
+
+```{r cars}
+generate_data <- function(type = c("all", "source", "target"), cov.type = 1, h = 10, K = 5, n.target = 400, n.source = rep(100, K), s = 5, p = 500, Ka = K) {
+  type <- match.arg(type)
+  sig.strength <- 0.5
+  source <- list()
+  
+  # Define the covariance matrix based on cov.type
+  if (cov.type == 1) {
+    Sigma <- outer(1:p, 1:p, function(x, y) 0.5^(abs(x - y)))
+  } else if (cov.type == 2) {
+    Sigma <- outer(1:p, 1:p, function(x, y) 0.9^(abs(x - y)))
+  }
+  R <- chol(Sigma)
+  
+  # Assuming you have defined n.target, p, R, sig.strength, and s
+  
+  # Generate target data for binomial family
+  if (type == "all" || type == "target") {
+    target_valid <- generateAndSplit(n.target, p = p, s = s, sig.strength, splitRatio = 0.5, R)
+    target <- target_valid$target
+    valid <- target_valid$valid
+  }
+  
+  # Generate source data for binomial family with the updated logic
+  if (type == "all" || type == "source") {
+    list_X_k <- list()
+    list_y_k <- list()
+    if (cov.type == 1) {
+      Sigma <- outer(1:p, 1:p, function(x,y){
+        0.5^(abs(x-y))
+      })
+      eps <- rnorm(p, sd = 0.3)
+      Sigma <- Sigma + eps %*% t(eps)
+      
+      R <- chol(Sigma)
+    }
+    
+    for (k in 1:K) {
+      if (k <= Ka) {
+        wk <- c(rep(sig.strength, s), rep(0, p - s)) + h / p * sample(c(-1, 1), size = p, replace = TRUE)
+      } else {
+        sig.index <- c(s + 1:s, sample((2 * s + 1):p, s))
+        wk <- rep(0, p)
+        wk[sig.index] <- sig.strength + 2 * h / p * sample(c(-1, 1), size = p, replace = TRUE)
+      }
+      x <- if (cov.type == 1) {
+        matrix(rnorm(n.source[k]*p), nrow = n.source[k]) %*% R
+      } else { # cov.type == 2
+        matrix(rt(n.source[k]*p, df = 4), nrow = n.source[k])
+      }
+      pr <- 1 / (1 + exp(-x %*% wk))
+      y <- sapply(1:n.source[k], function(i) {
+        sample(0:1, size = 1, prob = c(1 - pr[i], pr[i]))
+      })
+      list_X_k[[k]] <- x
+      list_y_k[[k]] <- y
+    }
+    source <- list(x = list_X_k, y = list_y_k)
+  }
+  
+  # Return data based on the requested type
+  if (type == "all") {
+    return(list(target = target, source = source, valid = valid))
+  } else if (type == "target") {
+    return(list(target = target))
+  } else { type == "source"
+    return(list(source = source))
+  }
+}
+```
+
+
+# helper functions, Ah and trans glm
+```{r}
+# Hyperparameter tuning and model fitting with error handling
+fit_model_with_retry <- function(x, y, family, alpha =1, nfolds = 5, max_retries = 5, offset = NULL) {
+  n.try <- 0
+  while (TRUE) {
+    if (!is.null(offset)) {
+      fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds, offset = offset), silent = TRUE)
+    } else {
+      fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds), silent = TRUE)
+    }
+    if (class(fit) != "try-error") {
+      return(fit)
+    }
+    n.try <- n.try + 1
+    if (n.try > max_retries) {
+      stop("Model fitting failed after ", max_retries, " retries.")
+    }
+  }
+}
+
+
+run_transferring_step <- function(source_X, source_y, target_folds_X, target_folds_y, validation_data, actual_labels, alpha = 1, family = "binomial") {
+  # Combine source data and the selected two folds of target data
+  combined_X <- rbind(source_X, target_folds_X)
+  combined_y <- c(source_y, target_folds_y)
+  
+  # Hyperparameter tuning within the training process
+  cv_results_w <- cv.glmnet(combined_X, combined_y, alpha = alpha, family = family, nfolds = 5)
+  best_lambda_w <- cv_results_w$lambda.min
+  
+  # Combined model with optimal hyperparameters
+  model_w <- glmnet(combined_X, combined_y, alpha = alpha, family = family, lambda = best_lambda_w)
+  
+  # Compute w_hat using the best lambda
+  w_hat <- coef(model_w, s = best_lambda_w)
+  # Replace NAs with 0s
+  w_hat[is.na(w_hat)] <- 0
+  
+  # Final coefficient vector
+  beta_hat <- w_hat 
+  
+  loss_k <- calculate_neg_log_likelihood(beta_hat, data = validation_data, actual_labels = actual_labels)
+  
+  return(list(beta_hat = beta_hat, best_lambda = best_lambda_w, model = model_w, loss_k = loss_k))
+}
+
+pooled_lasso_logistic <- function(X_target, y_target, X_source, y_source, X_valid, y_valid, family = "binomial", nfolds = 5, alpha = 1, s, p, type) {
+  # For evaluation metrics
+  # Combine target and all source data for the transferring step
+  X_combined <- do.call(rbind, c(list(X_target), X_source))
+  y_combined <- do.call(c, c(list(y_target), y_source))
+  # Ensure the combined data has matching dimensions
+  if (nrow(X_combined) != length(y_combined)) {
+    stop("Mismatch in the number of rows of combined_X and length of combined_y")
+  }
+  
+  # Transferring step with cross-validation to select best lambda
+  cv_model_w <- cv.glmnet(X_combined, y_combined, family = family, alpha = alpha, nfolds = nfolds)
+  best_lambda_w <- cv_model_w$lambda.min
+  model_w <- glmnet(X_combined, y_combined, family = family, alpha = alpha, lambda = best_lambda_w)
+  beta_hat <- coef(model_w, s = best_lambda_w)[-1] 
+  
+  # Generate predictions for evaluation
+  predictions <- predict(model_w, newx = X_valid, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  predictions_target <- predict(model_w, newx = X_target, type = "response")
+  predicted_classes_target <- ifelse(predictions_target > 0.5, 1, 0)
+  
+  # Evaluate predictions
+  metrics <- predict_log(predicted_classes, y_valid, beta_hat = beta_hat, s = s, p = p, type = type)
+  metrics_target <- predict_log(predicted_classes_target, y_target, beta_hat = beta_hat, s = s, p = p, type = type)
+  
+  return(list(beta_hat = beta_hat, evaluation_metrics = metrics, evaluation_metrics_target = metrics_target))
+}
+
+predict_log <- function(predicted, actual, type = 1, beta_hat = NULL, s = 5, p = 500){
+  library(caret)
+  cov.wk <- NULL
+  if (type == 1 && length(beta_hat) > 0){
+    cov.wk <- c(rep(0.5, s), rep(0, p - s))
+  } else if (type == 2 && length(beta_hat) > 0){
+    cov.wk <- c(rep(0.9, s), rep(0, p - s))
+  }
+  
+  if (length(beta_hat) != length(cov.wk)) {
+    warning("Length of beta_hat does not match length of cov.wk")
+  }
+  
+  # est_error_beta <- ifelse(!is.null(cov.wk), c(cov.wk - beta_hat), NULL)
+  # abs_error <- ifelse(!is.null(est_error_beta), abs(est_error_beta), NULL)
+  
+  l2_error_sum <- ifelse(!is.null(cov.wk), sum((cov.wk - beta_hat)^2)/length(beta_hat), NULL)
+  l2_error <- ifelse(!is.null(cov.wk), max(abs(cov.wk - beta_hat)), NULL)
+  
+  if (!is.null(cov.wk) && !any(is.na(abs(cov.wk - beta_hat)))){
+    # Small value to avoid division by zero
+    # Calculate percentage errors, avoiding division by zero by adding epsilon
+    #percentage_errors <- sum(abs((cov.wk - beta_hat))) #/ (cov.wk + epsilon)) * 100
+
+    # Sum of percentage errors
+    total_percentage_error <- log(sum(abs((cov.wk - beta_hat))) +10)
+    # absolute_percentage_error <- sum(abs((cov.wk - beta_hat) / cov.wk))
+    # 
+    # # Calculate the mean of these percentage errors
+    # mape <- mean(absolute_percentage_error, na.rm = TRUE)*100
+    l1_error_mean <- total_percentage_error
+    # if (std_dev_errors == 0) {
+    #   print("yes")
+    #   l1_error_mean <- sum(abs(cov.wk - beta_hat))  # Adjusting strategy for 0 standard deviation
+    # } else {
+    #   print("no")
+    #   l1_error_mean <- sum(((abs(cov.wk - beta_hat) - mean_errors) / std_dev_errors))
+    # }
+  } else {
+    l1_error_mean <- NA  # Handling cases where calculations cannot proceed
+  }
+  
+  if (!all(predicted %in% c(0, 1))){
+    predicted <- ifelse(predicted > 0.5, 1, 0)
+  }
+  
+  confusion_mat <- confusionMatrix(as.factor(predicted), as.factor(actual))
+  
+  beta_mag <- ifelse(!is.null(beta_hat), max(beta_hat), NULL)
+  
+  metrics_list <- list(
+    accuracy = confusion_mat$overall['Accuracy'],
+    precision = confusion_mat$byClass['Precision'],
+    recall = confusion_mat$byClass['Sensitivity'],
+    f1_score = confusion_mat$byClass['F1'],
+    specificity = confusion_mat$byClass['Specificity'],
+    fdr = 1 - confusion_mat$byClass['Precision'],
+    fnr = 1 - confusion_mat$byClass['Sensitivity'],
+    confusion_matrix = confusion_mat$table,
+    l2_error = l2_error,
+    l2_error_sum = l2_error_sum,
+    l1_avg = l1_error_mean,
+    beta_mag = beta_mag
+  )
+  
+  return(metrics_list)
+}
+
+
+calculate_neg_log_likelihood <- function(beta_hat, data, actual_labels){ #, best_lambda = NULL) 
+  # # Ensure that the model is a glm model and the family is binomial
+  # if (!inherits(model, "glm") || model$family$family != "binomial") {
+  #   stop("The model must be a glm model with binomial family.")
+  # }
+
+  x <- as.matrix.data.frame(data)
+  # Make predictions on the data
+  # predicted_probs <- predict(model, newx = data, type = "response")
+  wa <- beta_hat
+  # Actual labels
+  
+  # Calculate the negative log-likelihood loss
+  # if (!requireNamespace("Metrics", quietly = TRUE)) install.packages("Metrics")
+  # neg_log_likelihood <-Metrics::logLoss(actual_labels, predicted_probs)
+  xb <- x %*% wa[-1] + wa[1]
+  neg_log_likelihood <- as.numeric(- t(actual_labels) %*% xb + sum(log(1+exp(xb))))/length(actual_labels)
+  # neg_log_likelihood <- -sum(actual_labels * log(predicted_probs) + 
+  #                              (1 - actual_labels) * log(1 - predicted_probs))
+  return(neg_log_likelihood)
+}
+
+
+#ah_trans :
+Ah_trans_log <- function(TransferringID, X_target, y_target, X_source, y_source, X_valid, y_valid, type =1, s = 5, p = 500, alpha = 1, family = "binomial", nfolds = 5){
+  # type 1 means it is the known case where the cov type is 1 and the theoretical wk is compared with the beta_hat calculated later on
+  
+  combined_X <- X_target
+  combined_y <- y_target
+  for (i in TransferringID) {
+    combined_X <- rbind(combined_X, X_source[[i]])
+    combined_y <- c(combined_y, y_source[[i]])
+  }
+  
+  #new verion
+  cv_results_w <- fit_model_with_retry(combined_X, combined_y, family =  family, alpha = alpha, nfolds = nfolds)
+  best_lambda_w <- cv_results_w$lambda.min
+  
+  # Model fitting with optimal lambda
+  model_w <- glmnet(combined_X, combined_y, alpha = alpha, family = family, lambda = best_lambda_w)
+  
+  # Compute w_hat using the best lambda
+  w_hat <- coef(model_w, s = best_lambda_w)
+  w_hat[is.na(w_hat)] <- 0
+  
+  # Debiasing step
+  offset <- as.matrix(X_target) %*% w_hat[-1] + w_hat[1]
+  cv_results_delta <- fit_model_with_retry(X_target, y_target, family = family, alpha = alpha, nfolds = nfolds, offset = offset)
+  best_lambda_delta <- cv_results_delta$lambda.min
+  
+  # if (!isTRUE(all(model_w$glmnet.fit$lambda == lambda_w) && all(delta_model$glmnet.fit$lambda == lambda_delta))) {
+  #   warning("Model with combined data did not converge. Consider checking data or adjusting parameters.")
+  #   return(NULL)
+  # }
+  
+  delta_model <- glmnet(X_target, y_target, alpha = alpha, family = family, lambda = best_lambda_delta, offset = offset)
+  
+  # Compute delta_hat using the best lambda
+  delta_hat <- coef(delta_model, s = best_lambda_delta)
+  delta_hat[is.na(delta_hat)] <- 0
+  # Check for convergence in the model fit
+  
+  # Final coefficient vector
+  beta_hat <- w_hat + delta_hat
+  # Replace NAs with 0s
+  beta_hat[is.na(beta_hat)] <- 0
+  
+  y_pred <- as.numeric(1/(1+exp(-X_target %*% beta_hat[-1] - beta_hat[1])))
+  #y_pred <- ifelse(y_pred >= 0.5, 1, 0)
+  
+  y_pred_val <- as.numeric(1/(1+exp(-X_valid %*% beta_hat[-1] - beta_hat[1])))
+  #y_pred_val <- ifelse(y_pred >= 0.5, 1, 0)
+  wa <- beta_hat
+
+  xb <- X_target %*% wa[-1] + wa[1]
+  xval <- X_valid %*% wa[-1] + wa[1]
+  
+  neg_log_likelihood <- as.numeric(- t(y_target) %*% xb + sum(log(1+exp(xb))))/length(y_target)
+  neg_log_likelihood_val <-as.numeric(- t(y_valid) %*% xval + sum(log(1+exp(xval))))/length(y_valid)
+  eval_metrics_target <- predict_log(predicted = y_pred, 
+                                     actual = y_target, 
+                                     type =type, 
+                                     beta_hat = beta_hat[-1], 
+                                     s =s, 
+                                     p =p)
+  eval_valid <- predict_log(predicted = y_pred_val, 
+                            actual = y_valid, 
+                            type =type, 
+                            beta_hat = beta_hat[-1], 
+                            s =s, 
+                            p =p)
+  return(list(beta_hat = beta_hat, 
+              loss = neg_log_likelihood, 
+              loss_valid = neg_log_likelihood_val, 
+              eval_metrics_target = eval_metrics_target, 
+              eval_metrics_valid = eval_valid))
+}
+
+
+# Trans_glm :
+Ah_Trans_GLM_Logistic_TransferLearning <- function(X_target, y_target, X_source, y_source, X_valid, y_valid, C0 = 0.5, seed = 202310, num_folds = 5, s =5, p =500, type =1, alpha = 1, family = "binomial") {
+  set.seed(seed)
+  folds <- createFolds(y_target, k = num_folds, list = TRUE, returnTrain = TRUE)
+  
+  beta_hats <- vector("list", length(X_source))
+  loss_0 <- vector("list", num_folds)
+  loss_k <- vector("list", length(X_source))
+  
+  for (fold in 1:num_folds) {
+    train_indices <- unlist(folds[fold])
+    valid_indices <- setdiff(1:length(y_target), train_indices)
+    
+    train_X <- X_target[train_indices, ]
+    train_y <- y_target[train_indices]
+    valid_X <- X_target[valid_indices, ]
+    valid_y <- y_target[valid_indices]
+
+    cv_lasso <- cv.glmnet(train_X, train_y, alpha = alpha, family = family, nfolds = num_folds)
+
+    best_lambda_w0r <- cv_lasso$lambda.min
+    lasso_bench_mark_foldr <- glmnet(train_X, train_y, alpha = alpha, family = family, lambda = best_lambda_w0r)
+    beta_hat_lasso_bench <- coef.glmnet(lasso_bench_mark_foldr, lambda = best_lambda_w0r)
+    loss_0[fold] <- calculate_neg_log_likelihood(beta_hat_lasso_bench, valid_X, valid_y)
+    
+    for (i in seq_along(X_source)) {
+      source_X <- X_source[[i]]
+      source_y <- y_source[[i]]
+      result <- run_transferring_step(source_X, source_y, train_X, train_y, valid_X, valid_y, family = family, alpha = alpha)
+
+      beta_hats[[i]][[fold]] <- result$beta_hat
+
+      temp_loss <- calculate_neg_log_likelihood(result$beta_hat, data = valid_X, actual_labels = valid_y)
+
+
+      loss_k[[i]][[fold]] <- temp_loss
+    }
+  }
+
+  loss_0_final <- mean(unlist(loss_0))
+  k_average_loss <- sapply(loss_k, function(lk) mean(unlist(lk)))
+  sigma <- sd(unlist(loss_0))
+  sigma1 <- sqrt(sum((unlist(loss_0) - loss_0_final)^2) / (num_folds - 1))
+  threshold <- loss_0_final+ C0 * max(sigma, 0.01)
+  A <- which(k_average_loss <= threshold)
+  results_ah <- Ah_trans_log(TransferringID = A, X_target = X_target, y_target = y_target, X_source = X_source, y_source = y_source, X_valid = X_valid, y_valid = y_valid, s=s, p =p, type =type, alpha = alpha, family = family)
+
+  
+  return(list(beta_hat = results_ah$beta_hat, selected_A = A, loss_0 = loss_0, loss_target = loss_0_final, loss_valid = results_ah$loss_valid, loss_k_source = loss_k, evaluation_metrics_target = results_ah$eval_metrics_target, evaluation_metrics_valid = results_ah$eval_metrics_valid, threshold = threshold, k_average_loss = k_average_loss))
+}
+```
+
+# Iterations function
+```{r}
+iterate_and_accumulate_foreach <- function(X_target, y_target, X_source, y_source, X_valid, y_valid, C0=2, n_iterations =100, base_seed = 123, s = 5, p =500, type = 1, family = "binomial", alpha =1) {
+  # Register parallel backend
+  no_cores <- detectCores()-2
+  # Leave one core free
+  cl <- makeCluster(no_cores)
+  registerDoParallel(cl)
+  
+  # Export the necessary functions and libraries to each worker
+  clusterExport(cl, c("fit_model_with_retry", "run_transferring_step", "pooled_lasso_logistic", "predict_log", "calculate_neg_log_likelihood", "Ah_trans_log", "Ah_Trans_GLM_Logistic_TransferLearning"))
+  clusterEvalQ(cl, {
+    library(glmnet)
+    library(caret)
+  })
+  # Execute Ah_Trans_GLM_Logistic_TransferLearning in parallel
+  results <- foreach(i = 1:n_iterations, .packages = c("glmnet", "caret")) %dopar% {
+    set.seed(base_seed + i)  # Set seed for reproducibility
+    Ah_Trans_GLM_Logistic_TransferLearning(X_target = X_target, y_target = y_target, X_source = X_source, y_source = y_source, X_valid = X_valid, y_valid = y_valid, C0, seed = base_seed + i, s = s, p =p, type = type, family = family, alpha = alpha)
+  }
+  
+  # Stop the cluster
+  stopCluster(cl)
+  
+  # Initialize accumulators
+  beta_hat_acc <- NULL
+  l2_est_error_acc_target <- NULL
+  l2_est_error_sum_acc_target <- NULL
+  l1_avg <- NULL
+  loss_target_acc <- 0
+  loss_k_source_acc <- vector("list", length(results[[1]]$loss_k_source))
+  loss_valid_acc <- 0
+  best_accuracy <- -1 # Initialize best accuracy as very low
+  best_beta_hat <- NULL # To store beta_hat corresponding to the best accuracy
+  best_l2_beta_hat <- NULL
+  best_l2_est_error <- Inf
+  accuracy <- 0
+  accuracy_valid <- 0
+  beta_mag <- results[[1]]$evaluation_metrics_target$beta_mag
+  # Accumulate results
+  for (result in results) {
+    # Check and update best accuracy and corresponding beta_hat
+    current_accuracy <- result$evaluation_metrics_valid$accuracy # Assuming result contains eval_metrics with accuracy
+    current_l2_est_error <- result$evaluation_metrics_valid$l2_error
+    print(current_l2_est_error)# Assuming result contains eval_metrics with l2_estimation_error
+    # Accumulate beta_hat
+    if (is.null(beta_hat_acc)) {
+      beta_hat_acc <- result$beta_hat
+    } else {
+      beta_hat_acc <- beta_hat_acc + result$beta_hat
+    }
+    
+    if (is.null(l2_est_error_acc_target)) {
+      l2_est_error_acc_target <- result$evaluation_metrics_target$l2_error
+    } else {
+      l2_est_error_acc_target <- l2_est_error_acc_target + result$evaluation_metrics_target$l2_error
+    }
+    
+    if (is.null(l2_est_error_sum_acc_target)) {
+      l2_est_error_sum_acc_target <- result$evaluation_metrics_target$l2_error_sum
+    } else {
+      l2_est_error_sum_acc_target <- l2_est_error_sum_acc_target + result$evaluation_metrics_target$l2_error_sum
+    }
+    
+    if (is.null(l1_avg)) {
+      l1_avg <- result$evaluation_metrics_target$l1_avg
+    } else {
+      l1_est_error_sum_acc_target <- l1_avg + result$evaluation_metrics_target$l1_abg
+    }
+    
+    
+    
+    accuracy_valid <- accuracy_valid + current_accuracy
+    
+    accuracy <- accuracy + result$evaluation_metrics_target$accuracy
+    
+    if (current_accuracy > best_accuracy) {
+      best_accuracy <- current_accuracy
+      best_beta_hat <- result$beta_hat
+    }
+    
+    if (current_l2_est_error < best_l2_est_error) {
+      best_l2_est_error <- current_l2_est_error
+      best_l2_beta_hat <- result$beta_hat
+    }
+    
+    # Accumulate loss_target
+    loss_target_acc <- loss_target_acc + result$loss_target
+    loss_valid_acc <- loss_valid_acc + result$loss_valid
+    
+    # Accumulate loss_k_source element-wise
+    for (j in seq_along(loss_k_source_acc)) {
+      if (is.null(loss_k_source_acc[[j]])) {
+        loss_k_source_acc[[j]] <- result$k_average_loss[[j]][1]
+      } else {
+        loss_k_source_acc[[j]] <- mapply(`+`, loss_k_source_acc[[j]][1], result$loss_k_source[[j]], SIMPLIFY = FALSE)
+      }
+    }
+  }
+  
+  # Average beta_hat
+  beta_hat_avg <- beta_hat_acc / length(results)
+  
+  # Average l2_est_error
+  l2_error_avg <- l2_est_error_acc_target / length(results)
+  
+  l2_error_sum_avg_target <- l2_est_error_sum_acc_target / length(results)
+  
+  l1_avg <- l1_avg / length(results)
+  
+  # Average loss_target
+  loss_target_avg <- loss_target_acc / length(results)
+  loss_valid_avg <- loss_valid_acc / length(results)
+  
+  accuracy <- accuracy / length(results)
+
+  accuracy_valid <- accuracy_valid / length(results)
+  # Average loss_k_source element-wise
+  loss_k_source_avg <- lapply(loss_k_source_acc, function(x) {
+    # Check if x is numeric and perform division; otherwise, handle accordingly
+    if (is.numeric(x)) {
+      return(x / length(results))
+    } else {
+      # Adjust this part based on the actual structure of loss_k_source
+      # For example, if x is a list of numeric values:
+      return(lapply(x, function(y) y / length(results)))
+    }
+  })
+  
+  return(list(beta_hat_avg = beta_hat_avg, 
+              best_l2_beta_hat = best_l2_beta_hat, 
+              loss_target_avg = loss_target_avg,
+              loss_valid_avg = loss_valid_avg, 
+              loss_k_source_avg = loss_k_source_avg, 
+              best_beta_hat = best_beta_hat, 
+              best_accuracy = best_accuracy, 
+              l2_error = l2_error_avg,
+              l2_error_sum_avg_target = l2_error_sum_avg_target,
+              l1_avg = l1_avg,
+              beta_mag = beta_mag,
+              accuracy = accuracy, 
+              accuracy_valid = accuracy_valid))
+  
+}
+```
+
+```{r}
+# Start caffeinate in the background to prevent the system from sleeping
+data_p2000 <- generate_data(h = 20, K = 10, s = 20, n.target = 200, n.source = rep(200, 10), p = 2000, type = "all", cov.type = 2)
+
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results_2000 <- iterate_and_accumulate_foreach(X_target = data_p2000$target$x, y_target = data_p2000$target$y, X_source = data_p2000$source$source_X, y_source = data_p2000$source$source_y, X_valid = data_p2000$valid$x, y_valid = data_p2000$valid$y, n_iterations = 1, s = 20, p =2000, type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+```
+```{r}
+data_p2000k9 <- generate_data(h = 20, K = 9, s = 20, n.target = 200, n.source = rep(200, 10), p = 2000, type = "all", cov.type = 2)
+
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results_2000k9 <- iterate_and_accumulate_foreach(X_target = data_p2000k9$target$x, y_target = data_p2000k9$target$y, X_source = data_p2000k9$source$source_X, y_source = data_p2000k9$source$source_y, X_valid = data_p2000k9$valid$x, y_valid = data_p2000k9$valid$y, n_iterations = 1000, s = 20, p =2000, type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+data_p2000k8 <- generate_data(h = 20, K = 8, s = 20, n.target = 200, n.source = rep(200, 10), p = 2000, type = "all", cov.type = 2)
+
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results_2000k8 <- iterate_and_accumulate_foreach(X_target = data_p2000k8$target$x, y_target = data_p2000k8$target$y, X_source = data_p2000k8$source$source_X, y_source = data_p2000k8$source$source_y, X_valid = data_p2000k8$valid$x, y_valid = data_p2000k8$valid$y, n_iterations = 1000, s = 20, p =2000, type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+
+
+```
+```{r}
+# Function to generate data, run the iteration and accumulation, and return the results
+run_experiment <- function(K_value) {
+  data <- generate_data(h = 20, K = K_value, s = 20, n.target = 200, n.source = rep(200, K_value), p = 2000, type = "all", cov.type = 2)
+  results <- iterate_and_accumulate_foreach(X_target = data$target$x, y_target = data$target$y, X_source = data$source$source_X, y_source = data$source$source_y, X_valid = data$valid$x, y_valid = data$valid$y, n_iterations = 1, s = 20, p = 2000, type = 2)
+  return(results)
+}
+
+# Initialize a list to store dataframes for each K value
+all_results <- list()
+
+# Loop through K values
+K_values <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15) # example K values
+for (K in K_values) {
+  start_time <- Sys.time()
+  
+  # Run the experiment for the current K value
+  experiment_results <- run_experiment(K)
+  experiment_results$beta_hat<-list(as.matrix(experiment_results$beta_hat))
+  experiment_results$evaluation_metrics_target$confusion_matrix <- c(as.matrix(experiment_results$evaluation_metrics_target$confusion_matrix))
+  experiment_results$evaluation_metrics_$confusion_matrix <- c(as.matrix(experiment_results$evaluation_metrics_valid$confusion_matrix))
+  # Combine results with K as an additional column
+  experiment_results_df <- as.data.frame(experiment_results)
+  experiment_results_df$K <- K
+  
+  # Store the results
+  all_results[[paste("K", K, sep = "_")]] <- experiment_results_df
+  
+  end_time <- Sys.time()
+  
+  # Calculate and print the duration for the current K value
+  duration <- end_time - start_time
+  print(paste("Duration for K =", K, ":", duration))
+}
+
+# Combine all results into a single dataframe
+all_results_df <- do.call(rbind, all_results)
+
+```
+
+```{r}
+# Start caffeinate in the background to prevent the system from sleeping
+data_p2000_s5_h10_ <- generate_data(h = 20, K = 10, s = 20, n.target = 200, n.source = rep(200, 10), p = 2000, type = "all", cov.type = 2)
+
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results_2000 <- iterate_and_accumulate_foreach(X_target = data_p2000$target$x, y_target = data_p2000$target$y, X_source = data_p2000$source$source_X, y_source = data_p2000$source$source_y, X_valid = data_p2000$valid$x, y_valid = data_p2000$valid$y, n_iterations = 1000, s = 20, p =2000, type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+
+```{r}
+pooled_lasso_logistic <- function(X_target, y_target, X_source, y_source, X_valid, y_valid, family = "binomial", nfolds = 5, alpha = 1, s = 5, p = 500, type =1) {
+  # For evaluation metrics
+  # Combine target and all source data for the transferring step
+  X_combined <- do.call(rbind, c(list(X_target), X_source))
+  y_combined <- do.call(c, c(list(y_target), y_source))
+  # Ensure the combined data has matching dimensions
+  if (nrow(X_combined) != length(y_combined)) {
+    stop("Mismatch in the number of rows of combined_X and length of combined_y")
+  }
+  
+  # Transferring step with cross-validation to select best lambda
+  cv_model_w <- cv.glmnet(X_combined, y_combined, family = family, alpha = alpha, nfolds = nfolds)
+  best_lambda_w <- cv_model_w$lambda.min
+  model_w <- glmnet(X_combined, y_combined, family = family, alpha = alpha, lambda = best_lambda_w)
+  beta_hat <- coef(model_w, s = best_lambda_w)[-1] 
+  
+  # Generate predictions for evaluation
+  predictions <- predict(model_w, newx = X_valid, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  # Evaluate predictions
+  metrics <- predict_log(predicted_classes, y_valid, beta_hat = beta_hat, s = s, p = p, type = type)
+  
+  return(list(beta_hat = beta_hat, evaluation_metrics = metrics))
+}
+
+pooled_lasso_2000 <- pooled_lasso_logistic(X_target = data_p2000$target$x, y_target = data_p2000$target$y, X_source = data_p2000$source$x, y_source = data_p2000$source$y, X_valid = data_p2000$valid$x, y_valid = data_p2000$valid$y,s = 20, p = 2000, type = 2)
+```
+
+
+
+# naive_lasso
+```{r}
+naive_lasso <- function(x_target, y_target, x_valid, y_valid, nfolds = 5, s =20, p = 2000){
+  cv_model <- cv.glmnet(x_target, y_target, alpha = 1, family = "binomial", nfolds = nfolds)
+  best_lambda <- cv_model$lambda.min
+  model <- glmnet(x_target, y_target, alpha = 1, family = "binomial", nfolds = nfolds, lambda = best_lambda)
+  beta_hat <- coef(model, s = best_lambda)[-1] 
+  predictions <- predict(model, newx = x_valid, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  predictions_target <- predict(model, newx = x_target, type = "response")
+  predicted_classes_target <- ifelse(predictions_target > 0.5, 1, 0)
+  metrics <- predict_log(predicted_classes, y_valid,beta_hat = beta_hat, s = s, p = p, type =2)
+  metrcis_target <- predict_log(predicted_classes_target, y_target, beta_hat = beta_hat, s = s, p = p, type =2)
+  return(list(beta_hat = beta_hat, evaluation_metrics = metrics, target_metrics = metrcis_target))
+}
+baseline_naive_lasso_p2000 <- naive_lasso(x_target = data_p2000$target$x, y_target = data_p2000$target$y, x_valid = data_p2000$valid$x, y_valid = data_p2000$valid$y)
+trans_2000 <-Ah_Trans_GLM_Logistic_TransferLearning(X_target = data_p2000$target$x, y_target = data_p2000$target$y, X_source = data_p2000$source$x, y_source = data_p2000$source$y, X_valid = data_p2000$valid$x, y_valid = data_p2000$valid$y, s = 20, p =2000, type = 2)
+ah_trans <-Ah_trans_log(TransferringID = 1:10, X_target = data_p2000$target$x, y_target = data_p2000$target$y, X_source = data_p2000$source$x, y_source = data_p2000$source$y, X_valid = data_p2000$valid$x, y_valid = data_p2000$valid$y, s = 20, p =2000, type = 2, alpha = 1, family = "binomial")
+```
+
+
+#evaluation functions
+```{r}
+evaluate_and_compare <- function(X, Y, X_valid, Y_valid, beta_hat_avg, best_beta_hat, s = 5, p = 500, type = 1, alpha = 1, nfolds = 5) {
+  # Generate predictions using transfer learning approach (best accuracy with best beta_hat)
+  y_pred <- as.numeric(1 / (1 + exp(-X_valid %*% best_beta_hat[-1] - best_beta_hat[1])))
+  y_pred <- ifelse(y_pred >= 0.5, 1, 0)
+  
+  # Generate predictions using transfer learning approach
+  y_pred_avg <- as.numeric(1 / (1 + exp(-X_valid %*% beta_hat_avg[-1] - beta_hat_avg[1])))
+  y_pred_avg <- ifelse(y_pred >= 0.5, 1, 0)
+  
+  # Generate predictions using transfer learning approach
+  y_pred_avg_target <- as.numeric(1 / (1 + exp(-X %*% beta_hat_avg[-1] - beta_hat_avg[1])))
+  y_pred_avg_target <- ifelse(y_pred_avg_target >= 0.5, 1, 0)
+  
+  # Evaluate the transfer learning model
+  eval_metrics_tl <- confusionMatrix(factor(y_pred), factor(Y_valid))
+  eval_metrics_tl_avg <- confusionMatrix(factor(y_pred_avg), factor(Y_valid))
+  eval_metrics_tl_target <- confusionMatrix(factor(y_pred_avg_target), factor(Y))
+  # Perform cross-validation to find the optimal lambda for a baseline model
+  set.seed(123)  # For reproducibility
+  cv_lasso <- cv.glmnet(X, Y, family = "binomial", alpha = alpha, nfolds = nfolds)
+  optimal_lambda <- cv_lasso$lambda.min
+  
+  model <- glmnet(X, Y, alpha = alpha, family = "binomial", nfolds = nfolds, lambda = optimal_lambda)
+  
+  # Generate predictions using the baseline model
+  predictions_proba <- predict(model, newx = X_valid, type = "response", s = optimal_lambda)
+  predicted_classes <- ifelse(predictions_proba > 0.5, 1, 0)
+  # Extract coefficients at the optimal lambda
+  baseline_optimal_beta <- coef(cv_lasso, s = "lambda.min")
+  
+  if (type ==1 && length(beta_hat_avg) > 0){
+    cov.wk <- c(rep(0.5, s), rep(0, p - s))
+  }
+  else if(type ==2 && length(beta_hat_avg) > 0){
+    cov.wk <- c(rep(0.9, s), rep(0, p - s))
+  }
+  
+  if (length(beta_hat_avg[-1]) != length(cov.wk)) {
+    warning("Length of beta_hat does not match length of cov.wk")
+  }
+  
+  l2_error_avg <- ifelse(!is.null(cov.wk), sum((cov.wk - beta_hat_avg[-1])^2)/length(cov.wk), NULL)
+  l2_error_best <- ifelse(!is.null(cov.wk), sum((cov.wk - best_beta_hat[-1])^2)/length(cov.wk), NULL)
+  
+  # Evaluate the baseline model
+  eval_metrics_baseline <- confusionMatrix(factor(predicted_classes), factor(Y_valid))
+  l2_error_bl <- ifelse(!is.null(cov.wk), sum((cov.wk - baseline_optimal_beta[-1])^2)/length(cov.wk), NULL)
+  # Compare and return evaluation metrics
+  return(list(
+    transfer_learning = list(
+      Accuracy = eval_metrics_tl$overall['Accuracy'],
+      Precision = eval_metrics_tl$byClass['Precision'],
+      Recall = eval_metrics_tl$byClass['Sensitivity'],
+      F1 = eval_metrics_tl$byClass['F1'],
+      l2_error = l2_error_best
+    ),
+    transfer_learning_target = list(
+      Accuracy = eval_metrics_tl_target$overall['Accuracy'],
+      Precision = eval_metrics_tl_target$byClass['Precision'],
+      Recall = eval_metrics_tl_target$byClass['Sensitivity'],
+      F1 = eval_metrics_tl_target$byClass['F1'],
+      l2_error = l2_error_avg
+    ),
+    average_transfer_learning = list(
+      Accuracy = eval_metrics_tl_avg$overall['Accuracy'],
+      Precision = eval_metrics_tl_avg$byClass['Precision'],
+      Recall = eval_metrics_tl_avg$byClass['Sensitivity'],
+      F1 = eval_metrics_tl_avg$byClass['F1'],
+      l2_error = l2_error_avg
+    ),
+    baseline = list(
+      Accuracy = eval_metrics_baseline$overall['Accuracy'],
+      Precision = eval_metrics_baseline$byClass['Precision'],
+      Recall = eval_metrics_baseline$byClass['Sensitivity'],
+      F1 = eval_metrics_baseline$byClass['F1'],
+      l2_error = l2_error_bl
+    ),
+    beta_hat_avg = list(
+      beta_hat = beta_hat_avg
+    )
+  ))
+}
+
+# eval_com_2000 <- evaluate_and_compare(X = data_basic$target$x, Y = data_basic$target$y, beta_hat_avg = basic_iteration$beta_hat_avg, best_beta_hat =basic_iteration$best_beta_hat)
+
+```
+
+
+#looped evsaluations
+
+```{r}
+evaluate_and_store_results_h_k <- function(h_value = 10, K_values = 1:10, s_value = 5, num_target = 200, p_value = 500, C0 = 2, n_iterations =100, n_source = 100, type = "all", cov.type =1, alpha = 1, family = "binomial") {
+  results_list <- list() # Initialize empty list to store results
+  # Iterate over K values
+  for (K in K_values) {
+    # Generate binomial data
+    print(K)
+    set.seed(666+K)
+    binomial_data <- generate_data_test(h = h_value, K, n.target = num_target, n.source = rep(n_source, K), p = p_value, s = s_value, cov.type = cov.type, type = type)
+    
+    # Accumulate results
+    results <- iterate_and_accumulate_foreach(binomial_data$target$x, binomial_data$target$y, binomial_data$source$x, binomial_data$source$y, binomial_data$valid$x, binomial_data$valid$y, n_iterations = n_iterations, s = s_value, p = p_value, C0 = C0, type = cov.type, alpha = alpha, family = family)
+    
+    # Evaluate and compare
+    eval_com <- evaluate_and_compare(X = binomial_data$target$x, Y = binomial_data$target$y, X_valid = binomial_data$valid$x, Y_valid = binomial_data$valid$y, best_beta_hat = results$best_beta_hat, beta_hat_avg =results$beta_hat_avg, s = s_value, p = p_value, type = cov.type)
+    # eval_com$loss_target_beta_hat_avg <- list(loss_target_avg = results$loss_target_avg,
+    #                                           beta_hat_avg = as.vector(results$beta_hat_avg))
+    # Store results with an identifier
+    results_list[[paste("K", K, sep = "_")]] <- eval_com
+  }
+  # print(results_list)
+  # Convert list to dataframe for easier manipulation and storage (optional, depending on preference)
+  # This part might need customization based on the exact structure of eval_com
+  results_df <- do.call(rbind, lapply(names(results_list), function(name) {
+    data.frame(
+      ID = name,
+      TL_Accuracy = results_list[[name]]$transfer_learning$Accuracy,
+      TL_Precision = results_list[[name]]$transfer_learning$Precision,
+      TL_Recall = results_list[[name]]$transfer_learning$Recall,
+      TL_F1 = results_list[[name]]$transfer_learning$F1,
+      TL_l2 = results_list[[name]]$transfer_learning$l2_error,
+      TL_target_Accuracy = results_list[[name]]$transfer_learning_target$Accuracy,
+      TL_target_Precision = results_list[[name]]$transfer_learning_target$Precision,
+      TL_target_Recall = results_list[[name]]$transfer_learning_target$Recall,
+      TL_target_F1 = results_list[[name]]$transfer_learning_target$F1,
+      TL_target_l2 = results_list[[name]]$transfer_learning_target$l2_error,
+      Baseline_Accuracy = results_list[[name]]$baseline$Accuracy,
+      Baseline_Precision = results_list[[name]]$baseline$Precision,
+      Baseline_Recall = results_list[[name]]$baseline$Recall,
+      Baseline_F1 = results_list[[name]]$baseline$F1,
+      Baseline_l2 = results_list[[name]]$baseline$l2_error,
+      Avg_Accuracy = results_list[[name]]$average_transfer_learning$Accuracy, # Metrics from eval_com2
+      Avg_Precision = results_list[[name]]$average_transfer_learning$Precision,
+      Avg_Recall = results_list[[name]]$average_transfer_learning$Recall,
+      Avg_F1 = results_list[[name]]$average_transfer_learning$F1,
+      Avg_l2 = results_list[[name]]$average_transfer_learning$l2_error,
+      beta_hat = list(as.matrix(results_list[[name]]$beta_hat)),
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  return(results_df)
+}
+
+# # Example usage
+# h_value = 10
+# K_values = 1 # Define the range of K values you want to iterate over
+# lambda_w = 0.1
+# lambda_delta = 0.1
+# C0 = 2
+# n_iterations = 100
+
+#results_df_h10_k10 <- evaluate_and_store_results_h_k(K_values = 1:20, C0 = 2, n_iterations = 100)
+
+```
+# new iterations functions
+```{r}
+iterate_trans_glm <- function(K = 1, h_value = 10, num_target =200, n_source = 100, p_value = 500, s_value = 10, cov.type =1, type = "all", C0=2, n_iterations =100, base_seed = 123, family = "binomial", alpha =1, nfolds =5) {
+  # Register parallel backend
+  no_cores <- detectCores() - 2
+  cl <- makeCluster(no_cores)
+  registerDoParallel(cl)
+  
+  # Export the necessary functions and libraries to each worker
+  clusterExport(cl, c("generate_data", "generateAndSplit", "fit_model_with_retry", "run_transferring_step", "pooled_lasso_logistic", "predict_log", "calculate_neg_log_likelihood", "Ah_trans_log", "Ah_Trans_GLM_Logistic_TransferLearning"))
+  clusterEvalQ(cl, {
+    library(glmnet)
+    library(caret)
+  })
+  
+  # Execute Ah_Trans_GLM_Logistic_TransferLearning in parallel
+  results <- foreach(i = 1:n_iterations, .packages = c("glmnet", "caret")) %dopar% {
+    # Generate data for each iteration inside the loop
+    set.seed(base_seed + i)
+    binomial_data <- generate_data(h = h_value, K = K, n.target = num_target, n.source = rep(n_source, K), p = p_value, s = s_value, cov.type = cov.type, type = type)
+    
+    # Assign data directly
+    X_target <- binomial_data$target$x 
+    y_target <- binomial_data$target$y
+    X_source <- binomial_data$source$source_X
+    y_source <- binomial_data$source$source_y
+    X_valid <- binomial_data$valid$x
+    y_valid <- binomial_data$valid$y
+    
+    # Now use the assigned data with Ah_Trans_GLM_Logistic_TransferLearning or similar
+    Ah_Trans_GLM_Logistic_TransferLearning(X_target, y_target, X_source, y_source, X_valid, y_valid, C0, seed = base_seed + i, s = s_value, p = p_value, type = cov.type, family = family, alpha = alpha)
+  }
+  # Stop the cluster
+  stopCluster(cl)
+  
+  # Initialize accumulators
+  beta_hat_acc <- NULL
+  l2_est_error_acc_target <- NULL
+  l2_est_error_sum_acc_target <- NULL
+  l1_avg <- NULL
+  loss_target_acc <- 0
+  loss_k_source_acc <- vector("list", length(results[[1]]$loss_k_source))
+  loss_valid_acc <- 0
+  best_accuracy <- -1 # Initialize best accuracy as very low
+  best_beta_hat <- NULL # To store beta_hat corresponding to the best accuracy
+  best_l2_beta_hat <- NULL
+  best_l2_est_error <- Inf
+  accuracy <- 0
+  accuracy_valid <- 0
+  beta_mag <- results[[1]]$evaluation_metrics_target$beta_mag
+  # Accumulate results
+  for (result in results) {
+    # Accumulate beta_hat
+    if (is.null(beta_hat_acc)) {
+      beta_hat_acc <- result$beta_hat
+    } else {
+      beta_hat_acc <- beta_hat_acc + result$beta_hat
+    }
+    
+    if (is.null(l2_est_error_acc_target)) {
+      l2_est_error_acc_target <- result$evaluation_metrics_target$l2_error
+    } else {
+      l2_est_error_acc_target <- l2_est_error_acc_target + result$evaluation_metrics_target$l2_error
+    }
+    
+    if (is.null(l2_est_error_sum_acc_target)) {
+      l2_est_error_sum_acc_target <- result$evaluation_metrics_target$l2_error_sum
+    } else {
+      l2_est_error_sum_acc_target <- l2_est_error_sum_acc_target + result$evaluation_metrics_target$l2_error_sum
+    }
+    
+    if (is.null(l1_avg)) {
+      l1_avg <- result$evaluation_metrics_target$l1_avg
+    } else {
+      l1_est_error_sum_acc_target <- l1_avg + result$evaluation_metrics_target$l1_abg
+    }
+    
+    
+    # Check and update best accuracy and corresponding beta_hat
+    current_accuracy <- result$evaluation_metrics_valid$accuracy # Assuming result contains eval_metrics with accuracy
+    current_l2_est_error <- result$evaluation_metrics_valid$l2_error # Assuming result contains eval_metrics with l2_estimation_error
+    accuracy_valid <- accuracy_valid + current_accuracy
+    
+    accuracy <- accuracy + result$evaluation_metrics_target$accuracy
+    
+    if (current_accuracy > best_accuracy) {
+      best_accuracy <- current_accuracy
+      best_beta_hat <- result$beta_hat
+    }
+    
+    if (current_l2_est_error < best_l2_est_error) {
+      best_l2_est_error <- current_l2_est_error
+      best_l2_beta_hat <- result$beta_hat
+    }
+    
+    # Accumulate loss_target
+    loss_target_acc <- loss_target_acc + result$loss_target
+    loss_valid_acc <- loss_valid_acc + result$loss_valid
+    
+    # Accumulate loss_k_source element-wise
+    for (j in seq_along(loss_k_source_acc)) {
+      if (is.null(loss_k_source_acc[[j]])) {
+        loss_k_source_acc[[j]] <- result$k_average_loss[[j]][1]
+      } else {
+        loss_k_source_acc[[j]] <- mapply(`+`, loss_k_source_acc[[j]][1], result$loss_k_source[[j]], SIMPLIFY = FALSE)
+      }
+    }
+  }
+  
+  # Average beta_hat
+  beta_hat_avg <- beta_hat_acc / length(results)
+  
+  # Average l2_est_error
+  l2_error_avg <- l2_est_error_acc_target / length(results)
+  
+  l2_error_sum_avg_target <- l2_est_error_sum_acc_target / length(results)
+  
+  l1_avg <- l1_avg / length(results)
+  
+  # Average loss_target
+  loss_target_avg <- loss_target_acc / length(results)
+  loss_valid_avg <- loss_valid_acc / length(results)
+  
+  accuracy <- accuracy / length(results)
+  
+  accuracy_valid <- accuracy_valid / length(results)
+  # Average loss_k_source element-wise
+  loss_k_source_avg <- lapply(loss_k_source_acc, function(x) {
+    # Check if x is numeric and perform division; otherwise, handle accordingly
+    if (is.numeric(x)) {
+      return(x / length(results))
+    } else {
+      # Adjust this part based on the actual structure of loss_k_source
+      # For example, if x is a list of numeric values:
+      return(lapply(x, function(y) y / length(results)))
+    }
+  })
+  
+  return(list(beta_hat_avg = beta_hat_avg, 
+              best_l2_beta_hat = best_l2_beta_hat, 
+              loss_target_avg = loss_target_avg,
+              loss_valid_avg = loss_valid_avg, 
+              loss_k_source_avg = loss_k_source_avg, 
+              best_beta_hat = best_beta_hat, 
+              best_accuracy = best_accuracy, 
+              l2_error_highest = best_l2_est_error, 
+              l2_error_sum_avg_target = l2_error_sum_avg_target,
+              l1_avg = l1_avg,
+              beta_mag = beta_mag,
+              accuracy = accuracy, 
+              accuracy_valid = accuracy_valid))
+  
+}
+  
+  
+```
+#testing new iterate trans glm
+```{r}
+trans_basic_itr <- iterate_trans_glm(K=5, h_value=20, num_target=400, n_source=200, p_value=2000, s_value=10, cov.type=2)
+```
+
+```{r}
+# Use lapply to apply the function over K values from 1 to 10 and store the results in a list
+results_trans_h20target400source200p_value2000s10type2 <- lapply(1:10, function(K) {
+  iterate_trans_glm(K=K, h_value=20, num_target=400, n_source=200, p_value=2000, s_value=10, cov.type=2, n_iterations = 2)
+})
+
+results_trans_h20target400source200p_value2000s10type2 <- list()
+
+# Loop through K values from 1 to 10
+for (K in 1:10) {
+  result <- iterate_trans_glm(K=K, h_value=20, num_target=400, n_source=200, p_value=2000, s_value=10, cov.type=2)
+  results_trans_h20target400source200p_value2000s10type2[[K]] <- result
+}
+```
+
+#tests for looped eval
+```{r}
+results_test <- evaluate_and_store_results_h_k(h_value = 20, K_values = 1:10)
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results20_h10_k10_p2000_t200_s200 <- evaluate_and_store_results_h_k(K_values = 1:10, s_value = 20, num_target = 400, p_value = 2000, C0 = 2, n_iterations =10, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+
+```
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results20_df_h10_k10_p2000 <- evaluate_and_store_results_h_k(K_values = 1:10, s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =100, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results20_df_h10_k10_p2000, paste0(directory_path, "results20_df_h10_k10_p2000"), row.names = TRUE)
+
+```
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results20_df_h20_k10_p2000 <- evaluate_and_store_results_h_k(h_value = 20, K_values = 1:10, s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =100, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results20_df_h20_k10_p2000, paste0(directory_path, "results20_df_h20_k10_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+``` 
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results20_df_h30_k10_p2000 <- evaluate_and_store_results_h_k(h_value = 20, K_values = 1:10, s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =100, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results20_df_h20_k10_p2000, paste0(directory_path, "results20_df_h20_k10_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results15_df_h10_k10_sor150_p1000 <- evaluate_and_store_results_h_k(h_value = 10,s_value = 15, num_target = 200, p_value = 1000, C0 = 2, n_iterations =200, n_source = 150, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results15_df_h10_k10_sor150_p1000, paste0(directory_path, "results15_df_h10_k10_sor150_p1000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+``` 
+
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results10_df_h20_k10_sor200_p2000 <- evaluate_and_store_results_h_k(h_value = 20,s_value = 10, num_target = 200, p_value = 2000, C0 = 2, n_iterations =200, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results10_df_h20_k10_sor200_p2000, paste0(directory_path, "results10_df_h20_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+```{r, need to run later}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+conv_results10_df_h20_k10_sor200_p2000 <- evaluate_and_store_results_h_k(K_values = 1:30, h_value = 20,s_value = 10, num_target = 200, p_value = 2000, C0 = 2, n_iterations =1, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(conv_results10_df_h20_k10_sor200_p2000, paste0(directory_path, "conv_results10_df_h20_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+
+```{r}
+
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results5_df_h20_k10_sor200_p2000 <- evaluate_and_store_results_h_k(h_value = 20,s_value = 5, num_target = 200, p_value = 2000, C0 = 2, n_iterations =200, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results5_df_h20_k10_sor200_p2000, paste0(directory_path, "results5_df_h20_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+```
+
+```{r}
+
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+conv_results5_df_h20_k10_sor200_p2000 <- evaluate_and_store_results_h_k(K_values = 1:30, h_value = 20,s_value = 5, num_target = 200, p_value = 2000, C0 = 2, n_iterations = 1, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(conv_results5_df_h20_k10_sor200_p2000, paste0(directory_path, "conv_results5_df_h20_k10_sor200_p20000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+```
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results20_df_h40_k10_sor200_p2000 <- evaluate_and_store_results_h_k(h_value = 40,s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =100, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results20_df_h40_k10_sor200_p2000, paste0(directory_path, "results20_df_h40_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+conv_results20_df_h40_k10_sor200_p2000 <- evaluate_and_store_results_h_k(K_values = 1:30, h_value = 40,s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =1, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(conv_results20_df_h40_k10_sor200_p2000, paste0(directory_path, "conv_results20_df_h40_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results20_df_h30_k10_sor200_p2000 <- evaluate_and_store_results_h_k(h_value = 30,s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =100, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results20_df_h30_k10_sor200_p2000, paste0(directory_path, "results20_df_h30_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+conv_results20_df_h30_k10_sor200_p2000 <- evaluate_and_store_results_h_k(h_value = 30, K_values = 1:30, s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =1, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(conv_results20_df_h30_k10_sor200_p2000, paste0(directory_path, "conv_results20_df_h30_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+results20_df_h5_k10_sor200_p2000 <- evaluate_and_store_results_h_k(h_value = 5,s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =100, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(results20_df_h5_k10_sor200_p2000, paste0(directory_path, "results20_df_h5_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+#convergence
+
+# results20_df_h5_k10_sor200_p2000
+```{r}
+system("caffeinate &", wait = FALSE)
+
+start_time <- Sys.time()
+
+con_results20_df_h5_k10_sor200_p2000 <- evaluate_and_store_results_h_k(h_value = 5, K_values = 1:30, s_value = 20, num_target = 200, p_value = 2000, C0 = 2, n_iterations =1, n_source = 200, cov.type = 2)
+
+end_time <- Sys.time()
+
+# Calculate the duration
+duration <- end_time - start_time
+print(duration)
+
+directory_path <- "/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/"
+
+# Write data frames to CSV files in the specified directory with row names included
+write.csv(con_results20_df_h5_k10_sor200_p2000, paste0(directory_path, "con_results20_df_h5_k10_sor200_p2000"), row.names = TRUE)
+# Kill the caffeinate process to allow the system to sleep again
+system("pkill caffeinate")
+
+```
+
+## new data and results
+
+# Iterate_2000_chnaging K from 1:10
+```{r}
+ # Start caffeinate in the background to prevent the system from sleeping
+set.seed(2024)
+data_p200010 <- generate_data(h = 20, K = 10, s = 20, n.target = 400, n.source = rep(200, 10), p = 2000, type = "all", cov.type = 2)
+
+results_200010 <- iterate_and_accumulate_foreach(X_target = data_p200010$target$x, y_target = data_p200010$target$y, X_source = data_p200010$source$source_X, y_source = data_p200010$source$source_y, X_valid = data_p200010$valid$x, y_valid = data_p200010$valid$y, n_iterations = 10, s = 20, p =2000, type = 2)
+
+ # Start caffeinate in the background to prevent the system from sleeping
+set.seed(2025)
+data_p20009 <- generate_data(h = 20, K = 9, s = 20, n.target = 400, n.source = rep(200, 10), p = 2000, type = "all", cov.type = 2)
+
+results_20009 <- iterate_and_accumulate_foreach(X_target = data_p20009$target$x, y_target = data_p20009$target$y, X_source = data_p20009$source$source_X, y_source = data_p20009$source$source_y, X_valid = data_p20009$valid$x, y_valid = data_p20009$valid$y, n_iterations = 10, s = 20, p =2000, type = 2)
+
+set.seed(20258)
+data_p20008 <- generate_data(h = 20, K = 8, s = 20, n.target = 400, n.source = rep(200, 10), p = 2000, type = "all", cov.type = 2)
+
+results_20008 <- iterate_and_accumulate_foreach(X_target = data_p20008$target$x, y_target = data_p20008$target$y, X_source = data_p20008$source$source_X, y_source = data_p20008$source$source_y, X_valid = data_p20008$valid$x, y_valid = data_p20008$valid$y, n_iterations = 10, s = 20, p =2000, type = 2)
+
+# Set seed and generate data for K = 7
+set.seed(2026)
+data_p20007 <- generate_data(h = 20, K = 7, s = 20, n.target = 400, n.source = rep(200, 7), p = 2000, type = "all", cov.type = 2)
+# Accumulate results for K = 7
+results_20007 <- iterate_and_accumulate_foreach(X_target = data_p20007$target$x, y_target = data_p20007$target$y, X_source = data_p20007$source$source_X, y_source = data_p20007$source$source_y, X_valid = data_p20007$valid$x, y_valid = data_p20007$valid$y, n_iterations = 10, s = 20, p = 2000, type = 2)
+
+# Set seed and generate data for K = 6
+set.seed(2027)
+data_p20006 <- generate_data(h = 20, K = 6, s = 20, n.target = 400, n.source = rep(200, 6), p = 2000, type = "all", cov.type = 2)
+# Accumulate results for K = 6
+results_20006 <- iterate_and_accumulate_foreach(X_target = data_p20006$target$x, y_target = data_p20006$target$y, X_source = data_p20006$source$source_X, y_source = data_p20006$source$source_y, X_valid = data_p20006$valid$x, y_valid = data_p20006$valid$y, n_iterations = 10, s = 20, p = 2000, type = 2)
+
+# Repeat this pattern for K = 5 to K = 1, with n.target = 400
+set.seed(2028)
+data_p20005 <- generate_data(h = 20, K = 5, s = 20, n.target = 400, n.source = rep(200, 5), p = 2000, type = "all", cov.type = 2)
+results_20005 <- iterate_and_accumulate_foreach(X_target = data_p20005$target$x, y_target = data_p20005$target$y, X_source = data_p20005$source$source_X, y_source = data_p20005$source$source_y, X_valid = data_p20005$valid$x, y_valid = data_p20005$valid$y, n_iterations = 10, s = 20, p = 2000, type = 2)
+
+set.seed(2029)
+data_p20004 <- generate_data(h = 20, K = 4, s = 20, n.target = 400, n.source = rep(200, 4), p = 2000, type = "all", cov.type = 2)
+results_20004 <- iterate_and_accumulate_foreach(X_target = data_p20004$target$x, y_target = data_p20004$target$y, X_source = data_p20004$source$source_X, y_source = data_p20004$source$source_y, X_valid = data_p20004$valid$x, y_valid = data_p20004$valid$y, n_iterations = 10, s = 20, p = 2000, type = 2)
+
+set.seed(2030)
+data_p20003 <- generate_data(h = 20, K = 3, s = 20, n.target = 400, n.source = rep(200, 3), p = 2000, type = "all", cov.type = 2)
+results_20003 <- iterate_and_accumulate_foreach(X_target = data_p20003$target$x, y_target = data_p20003$target$y, X_source = data_p20003$source$source_X, y_source = data_p20003$source$source_y, X_valid = data_p20003$valid$x, y_valid = data_p20003$valid$y, n_iterations = 10, s = 20, p = 2000, type = 2)
+
+set.seed(2031)
+data_p20002 <- generate_data(h = 20, K = 2, s = 20, n.target = 400, n.source = rep(200, 2), p = 2000, type = "all", cov.type = 2)
+results_20002 <- iterate_and_accumulate_foreach(X_target = data_p20002$target$x, y_target = data_p20002$target$y, X_source = data_p20002$source$source_X, y_source = data_p20002$source$source_y, X_valid = data_p20002$valid$x, y_valid = data_p20002$valid$y, n_iterations = 10, s = 20, p = 2000, type = 2)
+
+set.seed(2032)
+data_p20001 <- generate_data(h = 20, K = 1, s = 20, n.target = 400, n.source = rep(200, 1), p = 2000, type = "all", cov.type = 2)
+results_20001 <- iterate_and_accumulate_foreach(X_target = data_p20001$target$x, y_target = data_p20001$target$y, X_source = data_p20001$source$source_X, y_source = data_p20001$source$source_y, X_valid = data_p20001$valid$x, y_valid = data_p20001$valid$y, n_iterations = 10, s = 20, p = 2000, type = 2)
+
+```
+#Naive Lasso Type 2, unknown sources
+```{r}
+# Generate and evaluate data for different K settings
+results_list_naive_20_h20_p2000_2 <- list() # Initialize list to store results
+
+for (K in 1:10) {
+  # Set a unique seed for each iteration to ensure reproducibility
+  set.seed(2020 + K)
+  
+  # Generate data
+  data_generated <- generate_data(h = 20, K = K, s = 20, n.target = 400, n.source = rep(200, K), p = 2000, type = "all", cov.type = 2)
+  
+  # Run naive_lasso
+  results <- naive_lasso(x_target = data_generated$target$x, y_target = data_generated$target$y, x_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s = 20, p = 2000)
+  
+  # Store results
+  results_list_naive_20_h20_p2000_2[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+
+# Naive unknow sources naive_15_h20_1000_150_2
+```{r}
+results_list_naive_15_h20_p1000_150_2 <- list() # Initialize list to store results
+
+for (K in 1:10) {
+  # Set a unique seed for each iteration to ensure reproducibility
+  set.seed(2020 + K)
+  
+  # Generate data
+  data_generated <- generate_data(h = 20, K = K, s = 15, n.target = 200, n.source = rep(150, K), p = 1000, type = "all", cov.type = 2)
+  
+  # Run naive_lasso
+  results <- naive_lasso(x_target = data_generated$target$x, y_target = data_generated$target$y, x_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s = 15, p = 1000)
+  
+  # Store results
+  results_list_naive_15_h20_p1000_150_2[[paste("K", K, sep = "_")]] <- results
+}
+```
+
+# naive10_h20_p500_100_2
+```{r}
+library(glmnet)
+library(caret)
+
+# Assuming 'predict_log' is a custom function defined elsewhere
+# Ensure this function is correctly defined in your environment
+
+# Placeholder for 'generate_data' and 'predict_log' function definitions
+
+results_list_naive10_h20_p500_100_2 <- list() # Initialize list to store results for p = 500
+
+for (K in 1:10) {
+  set.seed(2020 + K)  # Unique seed for reproducibility
+  
+  # Generate data with p = 500, s = 10, and varying K
+  data_generated <- generate_data(h = 20, K = K, s = 10, n.target = 200, n.source = rep(100, K), p = 500, type = "all", cov.type = 2)
+  
+  # Run naive_lasso with adjusted parameters for p = 500, s = 10
+  results <- naive_lasso(x_target = data_generated$target$x, y_target = data_generated$target$y, x_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s = 10, p = 500)
+  
+  # Store results
+  results_list_naive10_h20_p500_100_2[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+
+
+```{r}
+library(glmnet)
+library(caret)
+
+# Placeholder for 'generate_data' and 'predict_log' function definitions
+
+results_list_p1000 <- list() # Initialize list to store results for p = 1000
+
+for (K in 1:10) {
+  set.seed(2030 + K)  # Unique seed for reproducibility
+  
+  # Generate data with p = 1000, s = 15, and varying K
+  data_generated <- generate_data(h = 20, K = K, s = 15, n.target = 200, n.source = rep(150, K), p = 1000, type = "all", cov.type = 2)
+  
+  # Run naive_lasso with adjusted parameters for p = 1000, s = 15
+  results <- naive_lasso(x_target = data_generated$target$x, y_target = data_generated$target$y, x_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s = 15, p = 1000)
+  
+  # Store results
+  results_list_p1000[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+# Pooled Lasso Unknow Sources
+# p2000 2, unknow sources
+library(glmnet)
+library(caret)
+
+```{r}
+
+results_list_pooled_lasso_20_h20_p2000_2 <- list() # Initialize list to store results
+
+for (K in 1:10) {
+  set.seed(2020 + K)
+  
+  # Generate data
+  data_generated <- generate_data(h = 20, K = K, s = 20, n.target = 400, n.source = rep(200, K), p = 2000, type = "all", cov.type = 2)
+  
+  # Assume X_source and y_source need to be combined from multiple sources
+  # Placeholder for combining source data
+  
+  # Run pooled_lasso_logistic
+  results <- pooled_lasso_logistic(X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$x, y_source = data_generated$source$y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s =20, p =2000, type =2)
+  
+  # Store results
+  results_list_pooled_lasso_20_h20_p2000_2[[paste("K", K, sep = "_")]] <- results
+}
+```
+# p1000 pooled 2, unknow sources
+
+```{r}
+library(glmnet)
+library(caret)
+
+# Placeholder for 'generate_data' and 'predict_log' function definitions
+
+results_list_pooled_lasso_20_h20_p1000_2 <- list() # Initialize list to store results for p = 1000
+
+for (K in 1:10) {
+  set.seed(2030 + K)
+  
+  # Generate data with adjusted parameters
+  data_generated <- generate_data(h = 20, K = K, s = 15, n.target = 200, n.source = rep(150, K), p = 1000, type = "all", cov.type = 2)
+  
+  # Run pooled_lasso_logistic with adjusted parameters
+  results <- pooled_lasso_logistic(X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$x, y_source = data_generated$source$y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s= 15, p = 1000, type =2)
+  
+  # Store results
+  results_list_pooled_lasso_20_h20_p1000_2[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+# p500 pooled 2, unknow sources
+
+```{r}
+library(glmnet)
+library(caret)
+
+# Placeholder for 'generate_data' and 'predict_log' function definitions
+
+results_list_pooled_lasso_20_h20_p500_2 <- list() # Initialize list to store results for p = 500
+
+for (K in 1:10) {
+  set.seed(2020 + K)
+  
+  # Generate data with adjusted parameters
+  data_generated <- generate_data(h = 20, K = K, s = 10, n.target = 200, n.source = rep(100, K), p = 500, type = "all", cov.type = 2)
+  
+  # Run pooled_lasso_logistic with adjusted parameters
+  results <- pooled_lasso_logistic(X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$x, y_source = data_generated$source$y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s =10, p = 500, type =2)
+  
+  # Store results
+  results_list_pooled_lasso_20_h20_p500_2[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+
+
+# Iterate trans glm for h20_15_150_1000_2
+```{r}
+library(glmnet)
+library(caret)
+
+# Assuming necessary functions like generate_data and iterate_and_accumulate_foreach are defined
+
+# Initialize an empty list to store results for each K
+results_list_iterate_h20_15_150_1000_2 <- list()
+
+# Specify the range of K values you're interested in
+K_values <- 1:10  # For example, K from 1 to 10
+
+for (K in K_values) {
+  # Set a unique seed for reproducibility for each K
+  set.seed(2024 + K)
+  
+  # Generate data for the current K
+  data_generated <- generate_data(h = 20, K = K, s = 15, n.target = 200, n.source = rep(150, K), p = 1000, type = "all", cov.type = 2)
+  
+  # Accumulate results using iterate_and_accumulate_foreach
+  results <- iterate_and_accumulate_foreach(X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$source_X, y_source = data_generated$source$source_y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, n_iterations = 100, s = 15, p = 1000, type = 2)
+  
+  # Store results in the list
+  results_list_iterate_h20_15_150_1000_2[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+# Trans Lasso h20_15_150_1000_1
+```{r}
+library(glmnet)
+library(caret)
+
+# Assuming necessary functions like generate_data and iterate_and_accumulate_foreach are defined
+
+# Initialize an empty list to store results for each K
+results_list_iterate_h20_15_150_1000_1 <- list()
+
+# Specify the range of K values you're interested in
+K_values <- 1:10  # For example, K from 1 to 10
+
+for (K in K_values) {
+  # Set a unique seed for reproducibility for each K
+  set.seed(2020)
+  
+  # Generate data for the current K
+  data_generated <- generate_data(h = 20, K = K, s = 15, n.target = 200, n.source = rep(150, K), p = 1000, type = "all", cov.type = 1)
+  
+  # Accumulate results using iterate_and_accumulate_foreach
+  results <- iterate_and_accumulate_foreach(X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$source_X, y_source = data_generated$source$source_y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, n_iterations = 10, s = 50, p = 1000, type = 1)
+  
+  # Store results in the list
+  results_list_iterate_h20_15_150_1000_1[[paste("K", K, sep = "_")]] <- results
+}
+
+
+
+
+```
+
+# Trans Lasso h20_10_100_500_1, known sources
+
+```{r}
+library(glmnet)
+library(caret)
+
+# Assuming necessary functions like generate_data and iterate_and_accumulate_foreach are defined
+
+# Initialize an empty list to store results for each K
+results_list_iterate_h20_10_100_500_1 <- list()
+
+# Specify the range of K values you're interested in
+K_values <- 1:10  # For example, K from 1 to 10
+
+for (K in K_values) {
+  # Set a unique seed for reproducibility for each K
+  set.seed(2020 + K)
+  
+  # Generate data for the current K
+  data_generated <- generate_data(h = 20, K = K, s = 10, n.target = 200, n.source = rep(100, K), p = 500, type = "all", cov.type = 1)
+  
+  # Accumulate results using iterate_and_accumulate_foreach
+  results <- iterate_and_accumulate_foreach(X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$source_X, y_source = data_generated$source$source_y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, n_iterations = 100, s = 10, p = 500, type = 1)
+  
+  # Store results in the list
+  results_list_iterate_h20_10_100_500_1[[paste("K", K, sep = "_")]] <- results
+}
+
+
+```
+# Type 1 known sources: ah_trans_h20_15_150_1000_1
+
+```{r}
+library(glmnet)
+library(caret)
+
+# Initialize an empty list to store results for each K
+results_list_ah_trans_h20_15_150_1000_1 <- list()
+
+# Specify the range of K values you're interested in
+K_values <- 1:10
+
+for (K in K_values) {
+  set.seed(2020 + K)
+  
+  # Generate data for the current K
+  data_generated <- generate_data(h = 20, K = K, s = 15, n.target = 200, n.source = rep(150, K), p = 1000, type = "all", cov.type = 1)
+  
+  # Call Ah_trans_log with generated data
+  results <- Ah_trans_log(TransferringID = 1:K, X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$source_X, y_source = data_generated$source$source_y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s = 15, p = 1000, type = 1, alpha = 1, family = "binomial")
+  
+  # Store results
+  results_list_ah_trans_h20_15_150_1000_1[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+
+#Type 1 known sources: h20_10_100_500_1
+```{r}
+library(glmnet)
+library(caret)
+
+# Initialize an empty list to store results for each K
+results_list_ah_trans_h20_10_100_500_1 <- list()
+
+K_values <- 1:10  # Range of K values
+
+for (K in K_values) {
+  set.seed(2020 + K)  # Ensure reproducibility
+  
+  # Generate data with specific parameters
+  data_generated <- generate_data(h = 20, K = K, s = 10, n.target = 200, n.source = rep(100, K), p = 500, type = "all", cov.type = 1)
+  
+  # Call Ah_trans_log for each generated dataset
+  results <- Ah_trans_log(TransferringID = 1:K, X_target = data_generated$target$x, y_target = data_generated$target$y, X_source = data_generated$source$source_X, y_source = data_generated$source$source_y, X_valid = data_generated$valid$x, y_valid = data_generated$valid$y, s = 10, p = 500, type = 1, alpha = 1, family = "binomial")
+  
+  # Store results
+  results_list_ah_trans_h20_10_100_500_1[[paste("K", K, sep = "_")]] <- results
+}
+
+```
+# Trans GLM ALGO 2 data and results:
+```{r}
+# Initialize an empty list to store results for different K settings
+results_list_transGLM_2000 <- list()
+
+# Specify the range of K values you're interested in
+K_values <- 1:10  # For example, K from 1 to 10
+
+for (K in K_values) {
+  # Set a unique seed for reproducibility for each K
+  set.seed(2020 + K)
+  
+  # Assuming generate_data function is adaptable for p = 2000
+  # and 'generate_data' has been modified or can already accommodate different 's', 'p', and 'type' values.
+  data_2000 <- generate_data(h = 20, K = K, s = 20, n.target = 400, n.source = rep(200, K), p = 2000, type = "all", cov.type = 2)
+  
+  # Execute Ah_Trans_GLM_Logistic_TransferLearning with generated data
+  trans_2000_result <- Ah_Trans_GLM_Logistic_TransferLearning(
+    X_target = data_2000$target$x, 
+    y_target = data_2000$target$y, 
+    X_source = data_2000$source$x, 
+    y_source = data_2000$source$y, 
+    X_valid = data_2000$valid$x, 
+    y_valid = data_2000$valid$y, 
+    s = 20, 
+    p = 2000, 
+    type = 2
+  )
+  
+  # Store the result in the list
+  results_list_transGLM_2000[[paste("K", K, sep = "_")]] <- trans_2000_result
+}
+
+```
+# Trans GLM 
+#Trans GLM  s =20 p = 2000 n.source = 200
+```{r}
+# Initialize an empty list to store results for different K settings
+results_list_transGLM_2000_h40 <- list()
+
+# Specify the range of K values you're interested in
+K_values <- 1:10  # For example, K from 1 to 10
+
+for (K in K_values) {
+  # Set a unique seed for reproducibility for each K
+  set.seed(2020 + K)
+  
+  # Assuming generate_data function is adaptable for p = 2000
+  # and 'generate_data' has been modified or can already accommodate different 's', 'p', and 'type' values.
+  data_trGLM <- generate_data(h = 40, K = K, s = 20, n.target = 400, n.source = rep(200, K), p = 2000, type = "all", cov.type = 2)
+  
+  # Execute Ah_Trans_GLM_Logistic_TransferLearning with generated data
+  trans_2000_result <- Ah_Trans_GLM_Logistic_TransferLearning(
+    X_target = data_trGLM$target$x, 
+    y_target = data_trGLM$target$y, 
+    X_source = data_trGLM$source$x, 
+    y_source = data_trGLM$source$y, 
+    X_valid = data_trGLM$valid$x, 
+    y_valid = data_trGLM$valid$y, 
+    s = 20, 
+    p = 2000, 
+    type = 2
+  )
+  
+  # Store the result in the list
+  results_list_transGLM_2000_h40[[paste("K", K, sep = "_")]] <- trans_2000_result
+}
+```
+
+#Extract results and for list or data.frame to plot or analyze
+```{r}
+library(dplyr)
+
+# Initialize an empty data frame
+results_df <- data.frame(K = integer(),
+                         accuracy_valid = numeric(),
+                         l2_error = numeric(),
+                         l2_error_sum = numeric(),
+                         l1_avg = numeric(),
+                         beta_mag = numeric(),
+                         stringsAsFactors = FALSE)
+
+# Loop through the list and extract the data
+for (i in 1:length(results_list_p1000)) {
+  # The 'K' value is assumed to be represented by the index 'i'
+  k_value <- i
+  
+  # Extract the evaluation metrics for valid set
+  accuracy_valid <- results_list_p1000[[i]]$evaluation_metrics$accuracy
+  l2_error <- results_list_p1000[[i]]$evaluation_metrics$l2_error
+  l2_error_sum <- results_list_p1000[[i]]$evaluation_metrics$l2_error_sum
+  l1_avg <- results_list_p1000[[i]]$evaluation_metrics$l1_avg
+  beta_mag <- results_list_p1000[[i]]$evaluation_metrics$beta_mag
+  
+  # Combine into a data frame
+  k_results_df <- data.frame(K = k_value,
+                             accuracy_valid = accuracy_valid,
+                             l2_error = l2_error,
+                             l2_error_sum = l2_error_sum,
+                             l1_avg = l1_avg,
+                             beta_mag = beta_mag,
+                             stringsAsFactors = FALSE)
+  
+  # Bind with the main results data frame
+  results_df <- bind_rows(results_df, k_results_df)
+}
+
+# View the results data frame
+print(results_df)
+
+```
+
+
