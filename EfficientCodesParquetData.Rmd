@@ -1,0 +1,497 @@
+---
+title: "Final"
+author: "Lucas"
+date: "2024-02-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)
+library(glmnet)
+generate_binomial_data <- function(h = 5, K = 5, n.target = 200, n.source = rep(100, K), s = 5, p = 500, Ka = K) {
+  sig.strength <- 0.5
+  target <- NULL
+  source <- NULL
+  
+  # Generate target data
+  wk <- c(rep(sig.strength, s), rep(0, p - s))
+  Sigma <- outer(1:p, 1:p, function(x, y) {
+    0.5^(abs(x - y))
+  })
+  R <- chol(Sigma)
+  target$x <- matrix(rnorm(n.target * p), nrow = n.target) %*% R
+  pr <- 1 / (1 + exp(-target$x %*% wk))
+  target$y <- sapply(1:n.target, function(i) { sample(0:1, size = 1, prob = c(1 - pr[i], pr[i])) })
+  
+  # Initialize lists for X and y
+  list_X_k <- list()
+  list_y_k <- list()
+  
+  # Generate source data and populate lists
+  for (k in 1:K) {
+    if (k <= Ka) {
+      wk <- c(rep(sig.strength, s), rep(0, p - s)) + h / p * sample(c(-1, 1), size = p, replace = TRUE)
+    } else {
+      sig.index <- c(s + 1:s, sample((2 * s + 1):p, s))
+      wk <- rep(0, p)
+      wk[sig.index] <- sig.strength + 2 * h / p * sample(c(-1, 1), size = p, replace = TRUE)
+    }
+    x <- matrix(rnorm(n.source[k] * p), nrow = n.source[k]) %*% R
+    pr <- 1 / (1 + exp(-x %*% wk))
+    y <- sapply(1:n.source[k], function(i) {
+      sample(0:1, size = 1, prob = c(1 - pr[i], pr[i]))
+    })
+    list_X_k[[k]] <- x
+    list_y_k[[k]] <- y
+  }
+  
+  return(list(target = target, source = list(source_X = list_X_k, source_y = list_y_k)))
+}
+
+
+# Example usage
+set.seed(123)  # For reproducibility
+binomial_data <- generate_binomial_data()
+binomial_data2 <- generate_binomial_data(h = 20, K = 10)
+binomial_data3 <- generate_binomial_data(h = 30, K = 10)
+binomial_data4 <- generate_binomial_data(h = 40, K = 10)
+
+
+library(foreach)
+library(doParallel)
+library(caret)
+library(glmnet)
+
+# Assuming Ah_Trans_GLM_Logistic_TransferLearning is defined elsewhere
+
+iterate_and_accumulate_foreach <- function(X_train, y_train, list_X_k, list_y_k, lambda_w, lambda_delta, C0, n_iterations, base_seed = 123) {
+  # Register parallel backend
+  no_cores <- detectCores() - 4  
+  # Leave one core free
+  cl <- makeCluster(no_cores)
+  registerDoParallel(cl)
+  
+  
+  run_transferring_step <- function(source_X, source_y, target_folds_X, target_folds_y, validation_data, actual_labels) {
+    # Combine source data and the selected two folds of target data
+    combined_X <- rbind(source_X, target_folds_X)
+    combined_y <- c(source_y, target_folds_y)
+    
+    # Hyperparameter tuning within the training process
+    cv_results_w <- cv.glmnet(combined_X, combined_y, alpha = 1, family = "binomial", nfolds = 5)
+    best_lambda_w <- cv_results_w$lambda.min
+    
+    # Combined model with optimal hyperparameters
+    model_w <- glmnet(combined_X, combined_y, alpha = 1, family = "binomial", lambda = best_lambda_w)
+    
+    # Compute w_hat using the best lambda
+    w_hat <- coef(model_w, s = best_lambda_w)
+    # Replace NAs with 0s
+    w_hat[is.na(w_hat)] <- 0
+    
+    # Final coefficient vector
+    beta_hat <- w_hat 
+    
+    loss_k <- calculate_neg_log_likelihood(model = model_w, data = validation_data, actual_labels = actual_labels)
+    
+    return(list(beta_hat = beta_hat, lambda_w = best_lambda_w, model = model_w, loss_k = loss_k))
+  }
+  # Hyperparameter tuning and model fitting with error handling
+  fit_model_with_retry <- function(x, y, family, alpha, nfolds = 5, max_retries = 30, offset = NULL) {
+    n.try <- 0
+    while (TRUE) {
+      if (!is.null(offset)) {
+        fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds, offset = offset), silent = TRUE)
+      } else {
+        fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds), silent = TRUE)
+      }
+      if (class(fit) != "try-error") {
+        return(fit)
+      }
+      n.try <- n.try + 1
+      if (n.try > max_retries) {
+        stop("Model fitting failed after ", max_retries, " retries.")
+      }
+    }
+  }
+  
+  predict_log <- function(predicted, actual){
+    library(caret)
+    
+    # Assuming you have two vectors: actual (actual labels) and predicted (model predictions)
+    # actual <- c(...) # Replace with your actual labels
+    # predicted <- c(...) # Replace with your predictions
+    
+    confusion_mat <- confusionMatrix(as.factor(predicted), as.factor(actual))
+    
+    # Extracting different metrics
+    accuracy <- confusion_mat$overall['Accuracy']
+    precision <- confusion_mat$byClass['Precision']
+    recall <- confusion_mat$byClass['Sensitivity']  # Also known as recall
+    f1_score <- confusion_mat$byClass['F1']
+    specificity <- confusion_mat$byClass['Specificity']
+    fdr <- 1 - precision  # False Discovery Rate
+    fnr <- 1 - recall  # False Negative Rate
+    
+    # Storing metrics in a list
+    metrics_list <- list(
+      accuracy = accuracy,
+      precision = precision,
+      recall = recall,
+      f1_score = f1_score,
+      specificity = specificity,
+      fdr = fdr,
+      fnr = fnr,
+      confusion_matrix = confusion_mat$table
+    )
+  }
+  calculate_neg_log_likelihood <- function(model, data, actual_labels) {
+    # # Ensure that the model is a glm model and the family is binomial
+    # if (!inherits(model, "glm") || model$family$family != "binomial") {
+    #   stop("The model must be a glm model with binomial family.")
+    # }
+    x <- as.matrix.data.frame(data)
+    # Make predictions on the data
+    predicted_probs <- predict(model, newx = data, type = "response")
+    
+    # Actual labels
+    
+    # Calculate the negative log-likelihood loss
+    neg_log_likelihood <- -sum(actual_labels * log(predicted_probs) + 
+                                 (1 - actual_labels) * log(1 - predicted_probs))
+    # accuracy <- 
+    return(neg_log_likelihood)
+  }
+  Ah_Trans_GLM_Logistic_TransferLearning <- function(X_train, y_train, list_X_k, list_y_k, lambda_w, lambda_delta, C0 = 2, seed = 202310, num_folds = 5) {
+    set.seed(seed)
+    folds <- createFolds(y_train, k = num_folds, list = TRUE)
+    
+    beta_hats <- vector("list", length(list_X_k))
+    loss_0 <- vector("list", num_folds)
+    loss_k <- vector("list", length(list_X_k))
+    
+    for (fold in 1:num_folds) {
+      train_indices <- unlist(folds[fold])
+      valid_indices <- setdiff(1:length(y_train), train_indices)
+      
+      train_X <- X_train[train_indices, ]
+      train_y <- y_train[train_indices]
+      valid_X <- X_train[valid_indices, ]
+      valid_y <- y_train[valid_indices]
+      
+      cv_lasso <- cv.glmnet(train_X, train_y, alpha = 1, family = "binomial", nfolds = 5)
+      best_lambda_w0r <- cv_lasso$lambda.min
+      lasso_bench_mark_foldr <- glmnet(train_X, train_y, alpha = 1, family = "binomial", lambda = best_lambda_w0r)
+      
+      loss_0[fold] <- calculate_neg_log_likelihood(lasso_bench_mark_foldr, valid_X, valid_y)
+      
+      for (i in seq_along(list_X_k)) {
+        source_X <- list_X_k[[i]]
+        source_y <- list_y_k[[i]]
+        result <- run_transferring_step(source_X, source_y, train_X, train_y, valid_X, valid_y)
+        beta_hats[[i]][[fold]] <- result
+        loss_k[[i]][[fold]] <- calculate_neg_log_likelihood(result$model, valid_X, valid_y)
+      }
+    }
+    
+    loss_0_final <- mean(unlist(loss_0))
+    k_average_loss <- sapply(loss_k, function(lk) mean(unlist(lk)))
+    sigma <- sqrt(sum((unlist(loss_0) - loss_0_final)^2) / (num_folds - 1))
+
+    A <- which(abs(k_average_loss -loss_0_final) <= C0 * (sigma + 0.01))
+    combined_X <- X_train
+    combined_y <- y_train
+    for (i in A) {
+      combined_X <- rbind(combined_X, list_X_k[[i]])
+      combined_y <- c(combined_y, list_y_k[[i]])
+    }
+    
+    #new verion
+    cv_results_w <- fit_model_with_retry(combined_X, combined_y, "binomial", 1, 5)
+    best_lambda_w <- cv_results_w$lambda.min
+    
+    # Model fitting with optimal lambda
+    model_w <- glmnet(combined_X, combined_y, alpha = 1, family = "binomial", lambda = best_lambda_w)
+    
+    # Compute w_hat using the best lambda
+    w_hat <- coef(model_w, s = best_lambda_w)
+    w_hat[is.na(w_hat)] <- 0
+    
+    # Debiasing step
+    offset <- as.matrix(X_train) %*% w_hat[-1] + w_hat[1]
+    cv_results_delta <- fit_model_with_retry(X_train, y_train, "binomial", 1, 5, offset = offset)
+    best_lambda_delta <- cv_results_delta$lambda.min
+    
+    # if (!isTRUE(all(model_w$glmnet.fit$lambda == lambda_w) && all(delta_model$glmnet.fit$lambda == lambda_delta))) {
+    #   warning("Model with combined data did not converge. Consider checking data or adjusting parameters.")
+    #   return(NULL)
+    # }
+    
+    delta_model <- glmnet(X_train, y_train, alpha = 1, family = "binomial", lambda = best_lambda_delta, offset = offset)
+    
+    # Compute delta_hat using the best lambda
+    delta_hat <- coef(delta_model, s = best_lambda_delta)
+    delta_hat[is.na(delta_hat)] <- 0
+    # Check for convergence in the model fit
+    
+    # Final coefficient vector
+    beta_hat <- w_hat + delta_hat
+    # Replace NAs with 0s
+    beta_hat[is.na(beta_hat)] <- 0
+    
+    y_pred <- as.numeric(1/(1+exp(-X_train %*% beta_hat[-1] - beta_hat[1])))
+    y_pred <- ifelse(y_pred >= 0.5, 1, 0)
+    eval_metrics <- predict_log(predicted = y_pred, actual = y_train)
+    
+    return(list(beta_hat = beta_hat, selected_A = A, loss_target = loss_0_final, loss_k_source = loss_k, evaluation_metrics = eval_metrics))
+  }
+  # Execute Ah_Trans_GLM_Logistic_TransferLearning in parallel
+  results <- foreach(i = 1:n_iterations, .packages = c("glmnet", "caret")) %dopar% {
+    library(caret)
+    library(glmnet)
+    set.seed(base_seed + i)  # Set seed for reproducibility
+    Ah_Trans_GLM_Logistic_TransferLearning(X_train, y_train, list_X_k, list_y_k, C0, seed = base_seed + i)
+  }
+  
+  # Stop the cluster
+  stopCluster(cl)
+  
+  # Initialize accumulators
+  beta_hat_acc <- NULL
+  loss_target_acc <- 0
+  loss_k_source_acc <- vector("list", length(results[[1]]$loss_k_source))
+  best_accuracy <- -1 # Initialize best accuracy as very low
+  best_beta_hat <- NULL # To store beta_hat corresponding to the best accuracy
+  
+  # Accumulate results
+  for (result in results) {
+    # Accumulate beta_hat
+    if (is.null(beta_hat_acc)) {
+      beta_hat_acc <- result$beta_hat
+    } else {
+      beta_hat_acc <- beta_hat_acc + result$beta_hat
+    }
+    
+    # Check and update best accuracy and corresponding beta_hat
+    current_accuracy <- result$evaluation_metrics$accuracy # Assuming result contains eval_metrics with accuracy
+  
+    if (current_accuracy > best_accuracy) {
+      best_accuracy <- current_accuracy
+      best_beta_hat <- result$beta_hat
+    }
+    
+    # Accumulate loss_target
+    loss_target_acc <- loss_target_acc + result$loss_target
+
+    # Accumulate loss_k_source element-wise
+    for (j in seq_along(loss_k_source_acc)) {
+      if (is.null(loss_k_source_acc[[j]])) {
+        loss_k_source_acc[[j]] <- result$loss_k_source[[j]]
+      } else {
+        loss_k_source_acc[[j]] <- mapply(`+`, loss_k_source_acc[[j]], result$loss_k_source[[j]], SIMPLIFY = FALSE)
+      }
+    }
+  }
+  
+  # Average beta_hat
+  beta_hat_avg <- beta_hat_acc / length(results)
+  
+  # Average loss_target
+  loss_target_avg <- loss_target_acc / length(results)
+  
+  # Average loss_k_source element-wise
+  loss_k_source_avg <- lapply(loss_k_source_acc, function(x) {
+    # Check if x is numeric and perform division; otherwise, handle accordingly
+    if (is.numeric(x)) {
+      return(x / length(results))
+    } else {
+      # Adjust this part based on the actual structure of loss_k_source
+      # For example, if x is a list of numeric values:
+      return(lapply(x, function(y) y / length(results)))
+    }
+  })
+  
+  return(list(beta_hat_avg = beta_hat_avg, loss_target_avg = loss_target_avg, loss_k_source_avg = loss_k_source_avg, best_beta_hat = best_beta_hat, best_accuracy = best_accuracy))
+  
+}
+
+# Example usage
+# Adjust X_train, y_train, list_X_k, list_y_k with your actual data
+results1 <- iterate_and_accumulate_foreach(binomial_data$target$x, binomial_data$target$y, binomial_data$source$source_X, binomial_data$source$source_y, C0 = 2, n_iterations = 100)
+
+library(caret)
+library(glmnet)
+
+evaluate_and_compare <- function(X, Y, beta_hat_avg, best_beta_hat) {
+  # Generate predictions using transfer learning approach (best accuracy with best beta_hat)
+  y_pred <- as.numeric(1 / (1 + exp(-X %*% best_beta_hat[-1] - best_beta_hat[1])))
+  y_pred <- ifelse(y_pred >= 0.5, 1, 0)
+  
+  # Generate predictions using transfer learning approach
+  y_pred_avg <- as.numeric(1 / (1 + exp(-X %*% beta_hat_avg[-1] - beta_hat_avg[1])))
+  y_pred_avg <- ifelse(y_pred >= 0.5, 1, 0)
+  
+  # Evaluate the transfer learning model
+  eval_metrics_tl <- confusionMatrix(factor(y_pred), factor(Y))
+  eval_metrics_tl_avg <- confusionMatrix(factor(y_pred_avg), factor(Y))
+  # Perform cross-validation to find the optimal lambda for a baseline model
+  set.seed(123)  # For reproducibility
+  cv_lasso <- cv.glmnet(X, Y, family = "binomial", alpha = 1)
+  optimal_lambda <- cv_lasso$lambda.min
+  
+  # Generate predictions using the baseline model
+  predictions_proba <- predict(cv_lasso, newx = X, type = "response", s = optimal_lambda)
+  predicted_classes <- ifelse(predictions_proba > 0.5, 1, 0)
+  
+  # Evaluate the baseline model
+  eval_metrics_baseline <- confusionMatrix(factor(predicted_classes), factor(Y))
+  
+  # Compare and return evaluation metrics
+  return(list(
+    transfer_learning = list(
+      Accuracy = eval_metrics_tl$overall['Accuracy'],
+      Precision = eval_metrics_tl$byClass['Precision'],
+      Recall = eval_metrics_tl$byClass['Sensitivity'],
+      F1 = eval_metrics_tl$byClass['F1']
+    ),
+    average_transfer_learning = list(
+      Accuracy = eval_metrics_tl_avg$overall['Accuracy'],
+      Precision = eval_metrics_tl_avg$byClass['Precision'],
+      Recall = eval_metrics_tl_avg$byClass['Sensitivity'],
+      F1 = eval_metrics_tl_avg$byClass['F1']
+    ),
+    baseline = list(
+      Accuracy = eval_metrics_baseline$overall['Accuracy'],
+      Precision = eval_metrics_baseline$byClass['Precision'],
+      Recall = eval_metrics_baseline$byClass['Sensitivity'],
+      F1 = eval_metrics_baseline$byClass['F1']
+    )
+  ))
+}
+
+eval_com1 <- evaluate_and_compare(X = binomial_data$target$x, Y = binomial_data$target$y, beta_hat_avg = results1$beta_hat_avg, best_beta_hat =results1$best_beta_hat)
+```
+
+
+#EVALUATION FUNCTIONS
+h_k_s_p specified
+```{r}
+library(caret)
+library(glmnet)
+#h = 5, K = 5, n.target = 200, n.source = rep(100, K), s = 5, p = 500
+# Assuming the existence of `generate_binomial_data` and `iterate_and_accumulate_foreach` functions
+
+evaluate_and_store_results_h_k <- function(h_value = 10, K_values = 1:10, s_value = 5, num_target = 200, p_value = 500, C0, n_iterations) {
+  results_list <- list() # Initialize empty list to store results
+  
+  # Iterate over K values
+  for (K in K_values) {
+    # Generate binomial data
+    binomial_data <- generate_binomial_data(h = h_value, K, n.target = num_target, n.source = rep(100, K), p = p_value)
+    
+    # Accumulate results
+    results <- iterate_and_accumulate_foreach(binomial_data$target$x, binomial_data$target$y, binomial_data$source$source_X, binomial_data$source$source_y, C0 = C0, n_iterations = n_iterations)
+    
+    # Evaluate and compare
+    eval_com <- evaluate_and_compare(X = binomial_data$target$x, Y = binomial_data$target$y, best_beta_hat = results$best_beta_hat, beta_hat_avg =results$beta_hat_avg )
+    # eval_com$loss_target_beta_hat_avg <- list(loss_target_avg = results$loss_target_avg,
+    #                                           beta_hat_avg = as.vector(results$beta_hat_avg))
+    # Store results with an identifier
+    results_list[[paste("K", K, sep = "_")]] <- eval_com
+  }
+  
+  # Convert list to dataframe for easier manipulation and storage (optional, depending on preference)
+  # This part might need customization based on the exact structure of eval_com
+  results_df <- do.call(rbind, lapply(names(results_list), function(name) {
+    data.frame(
+      ID = name,
+      TL_Accuracy = results_list[[name]]$transfer_learning$Accuracy,
+      TL_Precision = results_list[[name]]$transfer_learning$Precision,
+      TL_Recall = results_list[[name]]$transfer_learning$Recall,
+      TL_F1 = results_list[[name]]$transfer_learning$F1,
+      Baseline_Accuracy = results_list[[name]]$baseline$Accuracy,
+      Baseline_Precision = results_list[[name]]$baseline$Precision,
+      Baseline_Recall = results_list[[name]]$baseline$Recall,
+      Baseline_F1 = results_list[[name]]$baseline$F1,
+      Avg_Accuracy = results_list[[name]]$average_transfer_learning$Accuracy, # Metrics from eval_com2
+      Avg_Precision = results_list[[name]]$average_transfer_learning$Precision,
+      Avg_Recall = results_list[[name]]$average_transfer_learning$Recall,
+      Avg_F1 = results_list[[name]]$average_transfer_learning$F1,
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  return(results_df)
+}
+
+# # Example usage
+# h_value = 10
+# K_values = 1 # Define the range of K values you want to iterate over
+# lambda_w = 0.1
+# lambda_delta = 0.1
+# C0 = 2
+# n_iterations = 100
+
+results_df_h10_k10 <- evaluate_and_store_results_h_k(K_values = 1:10, C0 = 2, n_iterations = 100)
+
+```
+
+```{r}
+# Plot the first series
+plot(x = 1:10, y = results_df_h10_k10$TL_Accuracy, type = "b", 
+     col = "blue", ylim = range(c(results_df_h10_k10$TL_Accuracy, results_df_h10_k10$Baseline_Accuracy)),
+     xlab = "Index", ylab = "Accuracy", main = "TL vs. Baseline Accuracy")
+
+# Add the second series to the same plot
+points(x = 1:10, y = results_df_h10_k10$Baseline_Accuracy, type = "b", 
+       col = "red")
+# Add a legend
+legend("topright", legend = c("TL_Accuracy", "Baseline_Accuracy"), 
+       col = c("blue", "red"), pch = 1, lty = 1)
+
+
+
+```
+
+
+```{r}
+library(arrow)
+file_path <- '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/feature_vectors_labels_glioma.parquet'
+
+# Read the Parquet file into an R data frame
+df <- read_parquet(file_path)
+
+# View the first few rows of the data frame
+head(df)
+```
+
+```{r}
+# Load the necessary library
+library(arrow)
+
+# Assuming 'file_path' is already set to your Parquet file location
+# file_path <- '/path/to/your/feature_vectors_labels_glioma.parquet'
+
+# Read the Parquet file into an R data frame
+df <- read_parquet(file_path)
+
+# View the first few rows of the data frame to understand its structure
+head(df)
+
+# Assuming the last column is the response variable (label)
+# Separate predictors (X) and response variable (y)
+
+# Extract the predictors into a matrix X
+X <- as.matrix(df[, -ncol(df)])  # Exclude the last column
+
+# Extract the response variable into a vector y
+y <- df[[ncol(df)]]  # Select the last column
+
+# Optionally, convert y to a numeric vector if it's not already
+y <- as.numeric(y)
+
+# Now, X is your matrix of predictors, and y is your vector of response variables.
+
+```
+
