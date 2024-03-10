@@ -4,7 +4,7 @@ author: "Lucas"
 date: "2024-02-13"
 output: html_document
 ---
-
+# Data for simulations
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(MASS)
@@ -50,327 +50,12 @@ generate_binomial_data <- function(h = 5, K = 5, n.target = 200, n.source = rep(
 }
 
 
-# Example usage
-set.seed(123)  # For reproducibility
-binomial_data <- generate_binomial_data()
-binomial_data2 <- generate_binomial_data(h = 20, K = 10)
-binomial_data3 <- generate_binomial_data(h = 30, K = 10)
-binomial_data4 <- generate_binomial_data(h = 40, K = 10)
-
-
 library(foreach)
 library(doParallel)
 library(caret)
 library(glmnet)
 
-# Assuming Ah_Trans_GLM_Logistic_TransferLearning is defined elsewhere
 
-iterate_and_accumulate_foreach <- function(X_train, y_train, list_X_k, list_y_k, lambda_w, lambda_delta, C0, n_iterations, base_seed = 123) {
-  # Register parallel backend
-  no_cores <- detectCores() - 4  
-  # Leave one core free
-  cl <- makeCluster(no_cores)
-  registerDoParallel(cl)
-  
-  
-  run_transferring_step <- function(source_X, source_y, target_folds_X, target_folds_y, validation_data, actual_labels) {
-    # Combine source data and the selected two folds of target data
-    combined_X <- rbind(source_X, target_folds_X)
-    combined_y <- c(source_y, target_folds_y)
-    
-    # Hyperparameter tuning within the training process
-    cv_results_w <- cv.glmnet(combined_X, combined_y, alpha = 1, family = "binomial", nfolds = 5)
-    best_lambda_w <- cv_results_w$lambda.min
-    
-    # Combined model with optimal hyperparameters
-    model_w <- glmnet(combined_X, combined_y, alpha = 1, family = "binomial", lambda = best_lambda_w)
-    
-    # Compute w_hat using the best lambda
-    w_hat <- coef(model_w, s = best_lambda_w)
-    # Replace NAs with 0s
-    w_hat[is.na(w_hat)] <- 0
-    
-    # Final coefficient vector
-    beta_hat <- w_hat 
-    
-    loss_k <- calculate_neg_log_likelihood(model = model_w, data = validation_data, actual_labels = actual_labels)
-    
-    return(list(beta_hat = beta_hat, lambda_w = best_lambda_w, model = model_w, loss_k = loss_k))
-  }
-  # Hyperparameter tuning and model fitting with error handling
-  fit_model_with_retry <- function(x, y, family, alpha, nfolds = 5, max_retries = 30, offset = NULL) {
-    n.try <- 0
-    while (TRUE) {
-      if (!is.null(offset)) {
-        fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds, offset = offset), silent = TRUE)
-      } else {
-        fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds), silent = TRUE)
-      }
-      if (class(fit) != "try-error") {
-        return(fit)
-      }
-      n.try <- n.try + 1
-      if (n.try > max_retries) {
-        stop("Model fitting failed after ", max_retries, " retries.")
-      }
-    }
-  }
-  
-  predict_log <- function(predicted, actual){
-    library(caret)
-    
-    # Assuming you have two vectors: actual (actual labels) and predicted (model predictions)
-    # actual <- c(...) # Replace with your actual labels
-    # predicted <- c(...) # Replace with your predictions
-    
-    confusion_mat <- confusionMatrix(as.factor(predicted), as.factor(actual))
-    
-    # Extracting different metrics
-    accuracy <- confusion_mat$overall['Accuracy']
-    precision <- confusion_mat$byClass['Precision']
-    recall <- confusion_mat$byClass['Sensitivity']  # Also known as recall
-    f1_score <- confusion_mat$byClass['F1']
-    specificity <- confusion_mat$byClass['Specificity']
-    fdr <- 1 - precision  # False Discovery Rate
-    fnr <- 1 - recall  # False Negative Rate
-    
-    # Storing metrics in a list
-    metrics_list <- list(
-      accuracy = accuracy,
-      precision = precision,
-      recall = recall,
-      f1_score = f1_score,
-      specificity = specificity,
-      fdr = fdr,
-      fnr = fnr,
-      confusion_matrix = confusion_mat$table
-    )
-  }
-  calculate_neg_log_likelihood <- function(model, data, actual_labels) {
-    # # Ensure that the model is a glm model and the family is binomial
-    # if (!inherits(model, "glm") || model$family$family != "binomial") {
-    #   stop("The model must be a glm model with binomial family.")
-    # }
-    x <- as.matrix.data.frame(data)
-    # Make predictions on the data
-    predicted_probs <- predict(model, newx = data, type = "response")
-    
-    # Actual labels
-    
-    # Calculate the negative log-likelihood loss
-    neg_log_likelihood <- -sum(actual_labels * log(predicted_probs) + 
-                                 (1 - actual_labels) * log(1 - predicted_probs))
-    # accuracy <- 
-    return(neg_log_likelihood)
-  }
-  Ah_Trans_GLM_Logistic_TransferLearning <- function(X_train, y_train, list_X_k, list_y_k, lambda_w, lambda_delta, C0 = 2, seed = 202310, num_folds = 5) {
-    set.seed(seed)
-    folds <- createFolds(y_train, k = num_folds, list = TRUE)
-    
-    beta_hats <- vector("list", length(list_X_k))
-    loss_0 <- vector("list", num_folds)
-    loss_k <- vector("list", length(list_X_k))
-    
-    for (fold in 1:num_folds) {
-      train_indices <- unlist(folds[fold])
-      valid_indices <- setdiff(1:length(y_train), train_indices)
-      
-      train_X <- X_train[train_indices, ]
-      train_y <- y_train[train_indices]
-      valid_X <- X_train[valid_indices, ]
-      valid_y <- y_train[valid_indices]
-      
-      cv_lasso <- cv.glmnet(train_X, train_y, alpha = 1, family = "binomial", nfolds = 5)
-      best_lambda_w0r <- cv_lasso$lambda.min
-      lasso_bench_mark_foldr <- glmnet(train_X, train_y, alpha = 1, family = "binomial", lambda = best_lambda_w0r)
-      
-      loss_0[fold] <- calculate_neg_log_likelihood(lasso_bench_mark_foldr, valid_X, valid_y)
-      
-      for (i in seq_along(list_X_k)) {
-        source_X <- list_X_k[[i]]
-        source_y <- list_y_k[[i]]
-        result <- run_transferring_step(source_X, source_y, train_X, train_y, valid_X, valid_y)
-        beta_hats[[i]][[fold]] <- result
-        loss_k[[i]][[fold]] <- calculate_neg_log_likelihood(result$model, valid_X, valid_y)
-      }
-    }
-    
-    loss_0_final <- mean(unlist(loss_0))
-    k_average_loss <- sapply(loss_k, function(lk) mean(unlist(lk)))
-    sigma <- sqrt(sum((unlist(loss_0) - loss_0_final)^2) / (num_folds - 1))
-
-    A <- which(abs(k_average_loss -loss_0_final) <= C0 * (sigma + 0.01))
-    combined_X <- X_train
-    combined_y <- y_train
-    for (i in A) {
-      combined_X <- rbind(combined_X, list_X_k[[i]])
-      combined_y <- c(combined_y, list_y_k[[i]])
-    }
-    
-    #new verion
-    cv_results_w <- fit_model_with_retry(combined_X, combined_y, "binomial", 1, 5)
-    best_lambda_w <- cv_results_w$lambda.min
-    
-    # Model fitting with optimal lambda
-    model_w <- glmnet(combined_X, combined_y, alpha = 1, family = "binomial", lambda = best_lambda_w)
-    
-    # Compute w_hat using the best lambda
-    w_hat <- coef(model_w, s = best_lambda_w)
-    w_hat[is.na(w_hat)] <- 0
-    
-    # Debiasing step
-    offset <- as.matrix(X_train) %*% w_hat[-1] + w_hat[1]
-    cv_results_delta <- fit_model_with_retry(X_train, y_train, "binomial", 1, 5, offset = offset)
-    best_lambda_delta <- cv_results_delta$lambda.min
-    
-    # if (!isTRUE(all(model_w$glmnet.fit$lambda == lambda_w) && all(delta_model$glmnet.fit$lambda == lambda_delta))) {
-    #   warning("Model with combined data did not converge. Consider checking data or adjusting parameters.")
-    #   return(NULL)
-    # }
-    
-    delta_model <- glmnet(X_train, y_train, alpha = 1, family = "binomial", lambda = best_lambda_delta, offset = offset)
-    
-    # Compute delta_hat using the best lambda
-    delta_hat <- coef(delta_model, s = best_lambda_delta)
-    delta_hat[is.na(delta_hat)] <- 0
-    # Check for convergence in the model fit
-    
-    # Final coefficient vector
-    beta_hat <- w_hat + delta_hat
-    # Replace NAs with 0s
-    beta_hat[is.na(beta_hat)] <- 0
-    
-    y_pred <- as.numeric(1/(1+exp(-X_train %*% beta_hat[-1] - beta_hat[1])))
-    y_pred <- ifelse(y_pred >= 0.5, 1, 0)
-    eval_metrics <- predict_log(predicted = y_pred, actual = y_train)
-    
-    return(list(beta_hat = beta_hat, selected_A = A, loss_target = loss_0_final, loss_k_source = loss_k, evaluation_metrics = eval_metrics))
-  }
-  # Execute Ah_Trans_GLM_Logistic_TransferLearning in parallel
-  results <- foreach(i = 1:n_iterations, .packages = c("glmnet", "caret")) %dopar% {
-    library(caret)
-    library(glmnet)
-    set.seed(base_seed + i)  # Set seed for reproducibility
-    Ah_Trans_GLM_Logistic_TransferLearning(X_train, y_train, list_X_k, list_y_k, C0, seed = base_seed + i)
-  }
-  
-  # Stop the cluster
-  stopCluster(cl)
-  
-  # Initialize accumulators
-  beta_hat_acc <- NULL
-  loss_target_acc <- 0
-  loss_k_source_acc <- vector("list", length(results[[1]]$loss_k_source))
-  best_accuracy <- -1 # Initialize best accuracy as very low
-  best_beta_hat <- NULL # To store beta_hat corresponding to the best accuracy
-  
-  # Accumulate results
-  for (result in results) {
-    # Accumulate beta_hat
-    if (is.null(beta_hat_acc)) {
-      beta_hat_acc <- result$beta_hat
-    } else {
-      beta_hat_acc <- beta_hat_acc + result$beta_hat
-    }
-    
-    # Check and update best accuracy and corresponding beta_hat
-    current_accuracy <- result$evaluation_metrics$accuracy # Assuming result contains eval_metrics with accuracy
-  
-    if (current_accuracy > best_accuracy) {
-      best_accuracy <- current_accuracy
-      best_beta_hat <- result$beta_hat
-    }
-    
-    # Accumulate loss_target
-    loss_target_acc <- loss_target_acc + result$loss_target
-
-    # Accumulate loss_k_source element-wise
-    for (j in seq_along(loss_k_source_acc)) {
-      if (is.null(loss_k_source_acc[[j]])) {
-        loss_k_source_acc[[j]] <- result$loss_k_source[[j]]
-      } else {
-        loss_k_source_acc[[j]] <- mapply(`+`, loss_k_source_acc[[j]], result$loss_k_source[[j]], SIMPLIFY = FALSE)
-      }
-    }
-  }
-  
-  # Average beta_hat
-  beta_hat_avg <- beta_hat_acc / length(results)
-  
-  # Average loss_target
-  loss_target_avg <- loss_target_acc / length(results)
-  
-  # Average loss_k_source element-wise
-  loss_k_source_avg <- lapply(loss_k_source_acc, function(x) {
-    # Check if x is numeric and perform division; otherwise, handle accordingly
-    if (is.numeric(x)) {
-      return(x / length(results))
-    } else {
-      # Adjust this part based on the actual structure of loss_k_source
-      # For example, if x is a list of numeric values:
-      return(lapply(x, function(y) y / length(results)))
-    }
-  })
-  
-  return(list(beta_hat_avg = beta_hat_avg, loss_target_avg = loss_target_avg, loss_k_source_avg = loss_k_source_avg, best_beta_hat = best_beta_hat, best_accuracy = best_accuracy))
-  
-}
-
-# Example usage
-# Adjust X_train, y_train, list_X_k, list_y_k with your actual data
-results1 <- iterate_and_accumulate_foreach(binomial_data$target$x, binomial_data$target$y, binomial_data$source$source_X, binomial_data$source$source_y, C0 = 2, n_iterations = 100)
-
-library(caret)
-library(glmnet)
-
-evaluate_and_compare <- function(X, Y, beta_hat_avg, best_beta_hat) {
-  # Generate predictions using transfer learning approach (best accuracy with best beta_hat)
-  y_pred <- as.numeric(1 / (1 + exp(-X %*% best_beta_hat[-1] - best_beta_hat[1])))
-  y_pred <- ifelse(y_pred >= 0.5, 1, 0)
-  
-  # Generate predictions using transfer learning approach
-  y_pred_avg <- as.numeric(1 / (1 + exp(-X %*% beta_hat_avg[-1] - beta_hat_avg[1])))
-  y_pred_avg <- ifelse(y_pred >= 0.5, 1, 0)
-  
-  # Evaluate the transfer learning model
-  eval_metrics_tl <- confusionMatrix(factor(y_pred), factor(Y))
-  eval_metrics_tl_avg <- confusionMatrix(factor(y_pred_avg), factor(Y))
-  # Perform cross-validation to find the optimal lambda for a baseline model
-  set.seed(123)  # For reproducibility
-  cv_lasso <- cv.glmnet(X, Y, family = "binomial", alpha = 1)
-  optimal_lambda <- cv_lasso$lambda.min
-  
-  # Generate predictions using the baseline model
-  predictions_proba <- predict(cv_lasso, newx = X, type = "response", s = optimal_lambda)
-  predicted_classes <- ifelse(predictions_proba > 0.5, 1, 0)
-  
-  # Evaluate the baseline model
-  eval_metrics_baseline <- confusionMatrix(factor(predicted_classes), factor(Y))
-  
-  # Compare and return evaluation metrics
-  return(list(
-    transfer_learning = list(
-      Accuracy = eval_metrics_tl$overall['Accuracy'],
-      Precision = eval_metrics_tl$byClass['Precision'],
-      Recall = eval_metrics_tl$byClass['Sensitivity'],
-      F1 = eval_metrics_tl$byClass['F1']
-    ),
-    average_transfer_learning = list(
-      Accuracy = eval_metrics_tl_avg$overall['Accuracy'],
-      Precision = eval_metrics_tl_avg$byClass['Precision'],
-      Recall = eval_metrics_tl_avg$byClass['Sensitivity'],
-      F1 = eval_metrics_tl_avg$byClass['F1']
-    ),
-    baseline = list(
-      Accuracy = eval_metrics_baseline$overall['Accuracy'],
-      Precision = eval_metrics_baseline$byClass['Precision'],
-      Recall = eval_metrics_baseline$byClass['Sensitivity'],
-      F1 = eval_metrics_baseline$byClass['F1']
-    )
-  ))
-}
-
-eval_com1 <- evaluate_and_compare(X = binomial_data$target$x, Y = binomial_data$target$y, beta_hat_avg = results1$beta_hat_avg, best_beta_hat =results1$best_beta_hat)
 ```
 
 
@@ -454,16 +139,16 @@ legend("topright", legend = c("TL_Accuracy", "Baseline_Accuracy"),
 
 ```
 
-
+#trial for reading in parquet data
 ```{r}
 library(arrow)
-file_path <- '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/feature_vectors_labels_glioma.parquet'
+file_path <- '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_train_labels_glioma.parquet'
 
 # Read the Parquet file into an R data frame
-df <- read_parquet(file_path)
+df_train_glioma <- read_parquet(file_path)
 
 # View the first few rows of the data frame
-head(df)
+head(df_train_glioma)
 ```
 
 ```{r}
@@ -473,20 +158,29 @@ library(arrow)
 # Assuming 'file_path' is already set to your Parquet file location
 # file_path <- '/path/to/your/feature_vectors_labels_glioma.parquet'
 
-# Read the Parquet file into an R data frame
-df <- read_parquet(file_path)
-
-# View the first few rows of the data frame to understand its structure
-head(df)
+# # Read the Parquet file into an R data frame
+# df <- read_parquet(file_path)
+# 
+# # View the first few rows of the data frame to understand its structure
+# head(df)
 
 # Assuming the last column is the response variable (label)
 # Separate predictors (X) and response variable (y)
+X_vectors <- df_train_glioma$Vector
+
+# Step 2: Combine the vectors into a matrix using do.call and rbind
+# Note: This step assumes that all vectors are of the same length. If they are not,
+# you may need to pad the shorter vectors with NA or some other value.
+matrix_data <- do.call(rbind, X_vectors)
+
+# Print the resulting matrix
+print(matrix_data)
 
 # Extract the predictors into a matrix X
-X <- as.matrix(df[, -ncol(df)])  # Exclude the last column
+X <- as.matrix(matrix_data)  # Exclude the last column
 
 # Extract the response variable into a vector y
-y <- df[[ncol(df)]]  # Select the last column
+y <- df_train_glioma[[ncol(df_train_glioma)]]  # Select the last column
 
 # Optionally, convert y to a numeric vector if it's not already
 y <- as.numeric(y)
@@ -494,4 +188,1117 @@ y <- as.numeric(y)
 # Now, X is your matrix of predictors, and y is your vector of response variables.
 
 ```
+
+```{r}
+
+library(foreach)
+library(doParallel)
+library(caret)
+library(glmnet)
+```
+# Generate Data Functions 
+```{r}
+generateAndSplit <- function(n.target, p, s, sig.strength, splitRatio = 0.5, R) {
+  library(caret)
+  
+  # Initialize lists for target, train, and valid datasets
+  target <- list(x = NULL, y = NULL)
+  train <- list(x = NULL, y = NULL)
+  valid <- list(x = NULL, y = NULL)
+  
+  # Generate synthetic data matrix
+  target$x <- matrix(rnorm(n.target * p), nrow = n.target) %*% R
+  pr <- 1 / (1 + exp(-target$x %*% c(rep(sig.strength, s), rep(0, p - s))))
+  target$y <- sapply(1:n.target, function(i) sample(0:1, size = 1, prob = c(1 - pr[i], pr[i])))
+  
+  # Set seed for reproducibility
+  set.seed(123)
+  
+  # Create folds for stratified sampling
+  folds <- createFolds(target$y, k = 1/splitRatio, list = TRUE, returnTrain = TRUE)
+  
+  # Using only the first fold for simplicity if you need a single split
+  trainIndices <- folds[[1]]
+  validIndices <- setdiff(1:n.target, trainIndices)
+  
+  # Create training set
+  train$x <- target$x[trainIndices, ]
+  train$y <- target$y[trainIndices]
+  
+  # Create validation set
+  valid$x <- target$x[validIndices, ]
+  valid$y <- target$y[validIndices]
+  
+  # Return a list containing the training and validation sets
+  return(list(target = train, valid = valid))
+}
+
+```
+
+```{r cars}
+generate_data <- function(type = c("all", "source", "target"), cov.type = 1, h = 10, K = 5, n.target = 400, n.source = rep(100, K), s = 5, p = 500, Ka = K) {
+  type <- match.arg(type)
+  sig.strength <- 0.5
+  source <- list()
+  
+  # Define the covariance matrix based on cov.type
+  if (cov.type == 1) {
+    Sigma <- outer(1:p, 1:p, function(x, y) 0.5^(abs(x - y)))
+  } else if (cov.type == 2) {
+    Sigma <- outer(1:p, 1:p, function(x, y) 0.9^(abs(x - y)))
+  }
+  R <- chol(Sigma)
+  
+  # Assuming you have defined n.target, p, R, sig.strength, and s
+  
+  # Generate target data for binomial family
+  if (type == "all" || type == "target") {
+    target_valid <- generateAndSplit(n.target, p = p, s = s, sig.strength, splitRatio = 0.5, R)
+    target <- target_valid$target
+    valid <- target_valid$valid
+  }
+  
+  # Generate source data for binomial family with the updated logic
+  if (type == "all" || type == "source") {
+    list_X_k <- list()
+    list_y_k <- list()
+    if (cov.type == 1) {
+      Sigma <- outer(1:p, 1:p, function(x,y){
+        0.5^(abs(x-y))
+      })
+      eps <- rnorm(p, sd = 0.3)
+      Sigma <- Sigma + eps %*% t(eps)
+      
+      R <- chol(Sigma)
+    }
+    
+    for (k in 1:K) {
+      if (k <= Ka) {
+        wk <- c(rep(sig.strength, s), rep(0, p - s)) + h / p * sample(c(-1, 1), size = p, replace = TRUE)
+      } else {
+        sig.index <- c(s + 1:s, sample((2 * s + 1):p, s))
+        wk <- rep(0, p)
+        wk[sig.index] <- sig.strength + 2 * h / p * sample(c(-1, 1), size = p, replace = TRUE)
+      }
+      x <- if (cov.type == 1) {
+        matrix(rnorm(n.source[k]*p), nrow = n.source[k]) %*% R
+      } else { # cov.type == 2
+        matrix(rt(n.source[k]*p, df = 4), nrow = n.source[k])
+      }
+      pr <- 1 / (1 + exp(-x %*% wk))
+      y <- sapply(1:n.source[k], function(i) {
+        sample(0:1, size = 1, prob = c(1 - pr[i], pr[i]))
+      })
+      list_X_k[[k]] <- x
+      list_y_k[[k]] <- y
+    }
+    source <- list(x = list_X_k, y = list_y_k)
+  }
+  
+  # Return data based on the requested type
+  if (type == "all") {
+    return(list(target = target, source = source, valid = valid))
+  } else if (type == "target") {
+    return(list(target = target))
+  } else { type == "source"
+    return(list(source = source))
+  }
+}
+```
+
+# change the functions and use the data for training
+
+# helper functions, Ah and trans glm
+```{r}
+# Hyperparameter tuning and model fitting with error handling
+fit_model_with_retry <- function(x, y, family = "binomial", alpha =1, nfolds = 5, max_retries = 5, offset = NULL) {
+  n.try <- 0
+  while (TRUE) {
+    if (!is.null(offset)) {
+      fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds, offset = offset), silent = TRUE)
+    } else {
+      fit <- try(cv.glmnet(x, y, alpha = alpha, family = family, nfolds = nfolds), silent = TRUE)
+    }
+    if (class(fit) != "try-error") {
+      return(fit)
+    }
+    n.try <- n.try + 1
+    if (n.try > max_retries) {
+      stop("Model fitting failed after ", max_retries, " retries.")
+    }
+  }
+}
+
+
+run_transferring_step <- function(source_X, source_y, target_folds_X, target_folds_y, validation_data, actual_labels, alpha = 1, family = "binomial") {
+  # Combine source data and the selected two folds of target data
+  combined_X <- rbind(source_X, target_folds_X)
+  combined_y <- c(source_y, target_folds_y)
+  
+  # Hyperparameter tuning within the training process
+  cv_results_w <- cv.glmnet(combined_X, combined_y, alpha = alpha, family = family, nfolds = 5)
+  best_lambda_w <- cv_results_w$lambda.min
+  
+  # Combined model with optimal hyperparameters
+  model_w <- glmnet(combined_X, combined_y, alpha = alpha, family = family, lambda = best_lambda_w)
+  
+  # Compute w_hat using the best lambda
+  w_hat <- coef(model_w, s = best_lambda_w)
+  # Replace NAs with 0s
+  w_hat[is.na(w_hat)] <- 0
+  
+  # Final coefficient vector
+  beta_hat <- w_hat 
+  
+  loss_k <- calculate_neg_log_likelihood(beta_hat, data = validation_data, actual_labels = actual_labels)
+  
+  return(list(beta_hat = beta_hat, best_lambda = best_lambda_w, model = model_w, loss_k = loss_k))
+}
+
+pooled_lasso_logistic_img <- function(X_target, y_target, X_source, y_source, X_valid, y_valid, family = "binomial", nfolds = 5, alpha = 1) {
+  # For evaluation metrics
+  # Combine target and all source data for the transferring step
+  X_combined <- do.call(rbind, c(list(X_target), X_source))
+  y_combined <- do.call(c, c(list(y_target), y_source))
+  # Ensure the combined data has matching dimensions
+  if (nrow(X_combined) != length(y_combined)) {
+    stop("Mismatch in the number of rows of combined_X and length of combined_y")
+  }
+  
+  # Transferring step with cross-validation to select best lambda
+  cv_model_w <- cv.glmnet(X_combined, y_combined, family = family, alpha = alpha, nfolds = nfolds)
+  best_lambda_w <- cv_model_w$lambda.min
+  model_w <- glmnet(X_combined, y_combined, family = family, alpha = alpha, lambda = best_lambda_w)
+  beta_hat <- coef(model_w, s = best_lambda_w)[-1] 
+  
+  # Generate predictions for evaluation
+  predictions <- predict(model_w, newx = X_valid, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  predictions_target <- predict(model_w, newx = X_target, type = "response")
+  predicted_classes_target <- ifelse(predictions_target > 0.5, 1, 0)
+  
+  # Evaluate predictions
+  metrics <- predict_log_img(predicted_classes, y_valid, beta_hat = beta_hat, s = NULL, p = NULL, type = NULL, RealDataStatus = TRUE)
+  metrics_target <- predict_log_img(predicted_classes_target, y_target, beta_hat = beta_hat, s = NULL, p = NULL, type = NULL, RealDataStatus = TRUE)
+  
+  return(list(beta_hat = beta_hat, evaluation_metrics = metrics, evaluation_metrics_target = metrics_target))
+}
+
+predict_log_img <- function(predicted, actual, RealDataStatus = FALSE, type = NULL, beta_hat = NULL, s = NULL, p = NULL) {
+  library(caret)
+  
+  cov.wk <- NULL
+  l2_error_sum <- NULL
+  l1_error <- NULL
+  l1_error_mean <- NULL
+  
+  # Check if RealDataStatus is TRUE or type, s, or p are NULL
+  if (!RealDataStatus && !is.null(type) && !is.null(s) && !is.null(p) && length(beta_hat) > 0) {
+    if (type == 1) {
+      cov.wk <- c(rep(0.5, s), rep(0, p - s))
+    } else if (type == 2) {
+      cov.wk <- c(rep(0.9, s), rep(0, p - s))
+    }
+
+    if (length(beta_hat) != length(cov.wk)) {
+      warning("Length of beta_hat does not match length of cov.wk")
+    }
+
+    l2_error_sum <- ifelse(!is.null(cov.wk), sum((cov.wk - beta_hat)^2)/length(beta_hat), NULL)
+    l1_error <- ifelse(!is.null(cov.wk), max(abs(cov.wk - beta_hat)), NULL)
+  
+    if (!is.null(cov.wk) && !any(is.na(abs(cov.wk - beta_hat)))){
+      total_percentage_error <- log(sum(abs((cov.wk - beta_hat))) + 10)
+      l1_error_mean <- total_percentage_error
+    } else {
+      l1_error_mean <- NA
+    }
+  }
+
+  # Adjust the handling of predicted values based on RealDataStatus
+  if (!all(predicted %in% c(0, 1))){
+    predicted <- ifelse(predicted > 0.5, 1, 0)
+  }
+  
+  confusion_mat <- confusionMatrix(as.factor(predicted), as.factor(actual))
+  
+  beta_mag <- ifelse(!is.null(beta_hat), max(beta_hat), NULL)
+  
+  if (isFALSE(RealDataStatus)){
+    metrics_list <- list(
+    accuracy = confusion_mat$overall['Accuracy'],
+    precision = confusion_mat$byClass['Precision'],
+    recall = confusion_mat$byClass['Sensitivity'],
+    f1_score = confusion_mat$byClass['F1'],
+    specificity = confusion_mat$byClass['Specificity'],
+    fdr = 1 - confusion_mat$byClass['Precision'],
+    fnr = 1 - confusion_mat$byClass['Sensitivity'],
+    confusion_matrix = confusion_mat$table,
+    l1_error = l1_error,
+    l2_error_sum = l2_error_sum,
+    l1_avg = l1_error_mean,
+    beta_mag = beta_mag
+  )
+  }
+  metrics_list <- list(
+    accuracy = confusion_mat$overall['Accuracy'],
+    precision = confusion_mat$byClass['Precision'],
+    recall = confusion_mat$byClass['Sensitivity'],
+    f1_score = confusion_mat$byClass['F1'],
+    specificity = confusion_mat$byClass['Specificity'],
+    fdr = 1 - confusion_mat$byClass['Precision'],
+    fnr = 1 - confusion_mat$byClass['Sensitivity'],
+    confusion_matrix = confusion_mat$table,
+    beta_mag = beta_mag
+  )
+  
+  return(metrics_list)
+}
+
+
+naive_lasso <- function(x_target, y_target, x_valid, y_valid, nfolds = 5){
+  cv_model <- cv.glmnet(x_target, y_target, alpha = 1, family = "binomial", nfolds = nfolds)
+  best_lambda <- cv_model$lambda.min
+  model <- glmnet(x_target, y_target, alpha = 1, family = "binomial", nfolds = nfolds, lambda = best_lambda)
+  beta_hat <- coef(model, s = best_lambda)[-1] 
+  predictions <- predict(model, newx = x_valid, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  predictions_target <- predict(model, newx = x_target, type = "response")
+  predicted_classes_target <- ifelse(predictions_target > 0.5, 1, 0)
+  metrics <- predict_log_img(predicted_classes, y_valid,beta_hat = beta_hat, s = NULL, p = NULL, type =NULL, RealDataStatus = TRUE)
+  metrcis_target <- predict_log_img(predicted_classes_target, y_target, beta_hat = beta_hat, s = NULL, p = NULL, type =NULL, RealDataStatus = TRUE)
+  return(list(beta_hat = beta_hat, evaluation_metrics = metrics, target_metrics = metrcis_target))
+}
+calculate_neg_log_likelihood <- function(beta_hat, data, actual_labels){ #, best_lambda = NULL) 
+  # # Ensure that the model is a glm model and the family is binomial
+  # if (!inherits(model, "glm") || model$family$family != "binomial") {
+  #   stop("The model must be a glm model with binomial family.")
+  # }
+
+  x <- as.matrix.data.frame(data)
+  # Make predictions on the data
+  # predicted_probs <- predict(model, newx = data, type = "response")
+  wa <- beta_hat
+  # Actual labels
+  
+  # Calculate the negative log-likelihood loss
+  # if (!requireNamespace("Metrics", quietly = TRUE)) install.packages("Metrics")
+  # neg_log_likelihood <-Metrics::logLoss(actual_labels, predicted_probs)
+  xb <- x %*% wa[-1] + wa[1]
+  neg_log_likelihood <- as.numeric(- t(actual_labels) %*% xb + sum(log(1+exp(xb))))/length(actual_labels)
+  # neg_log_likelihood <- -sum(actual_labels * log(predicted_probs) + 
+  #                              (1 - actual_labels) * log(1 - predicted_probs))
+  return(neg_log_likelihood)
+}
+
+
+#ah_trans :
+Ah_trans_log_img <- function(TransferringID, X_target, y_target, X_source, y_source, X_valid, y_valid, alpha = 1, family = "binomial", nfolds = 5){
+  # type 1 means it is the known case where the cov type is 1 and the theoretical wk is compared with the beta_hat calculated later on
+  
+  combined_X <- X_target
+  combined_y <- y_target
+  for (i in TransferringID) {
+    combined_X <- rbind(combined_X, X_source[[i]])
+    combined_y <- c(combined_y, y_source[[i]])
+  }
+  
+  #new verion
+  cv_results_w <- fit_model_with_retry(combined_X, combined_y, family =  family, alpha = alpha, nfolds = nfolds)
+  best_lambda_w <- cv_results_w$lambda.min
+  
+  # Model fitting with optimal lambda
+  model_w <- glmnet(combined_X, combined_y, alpha = alpha, family = family, lambda = best_lambda_w)
+  
+  # Compute w_hat using the best lambda
+  w_hat <- coef(model_w, s = best_lambda_w)
+  w_hat[is.na(w_hat)] <- 0
+  
+  # Debiasing step
+  offset <- as.matrix(X_target) %*% w_hat[-1] + w_hat[1]
+  cv_results_delta <- fit_model_with_retry(X_target, y_target, family = family, alpha = alpha, nfolds = nfolds, offset = offset)
+  best_lambda_delta <- cv_results_delta$lambda.min
+  
+  # if (!isTRUE(all(model_w$glmnet.fit$lambda == lambda_w) && all(delta_model$glmnet.fit$lambda == lambda_delta))) {
+  #   warning("Model with combined data did not converge. Consider checking data or adjusting parameters.")
+  #   return(NULL)
+  # }
+  
+  delta_model <- glmnet(X_target, y_target, alpha = alpha, family = family, lambda = best_lambda_delta, offset = offset)
+  
+  # Compute delta_hat using the best lambda
+  delta_hat <- coef(delta_model, s = best_lambda_delta)
+  delta_hat[is.na(delta_hat)] <- 0
+  # Check for convergence in the model fit
+  
+  # Final coefficient vector
+  beta_hat <- w_hat + delta_hat
+  # Replace NAs with 0s
+  beta_hat[is.na(beta_hat)] <- 0
+  
+  y_pred <- as.numeric(1/(1+exp(-X_target %*% beta_hat[-1] - beta_hat[1])))
+  #y_pred <- ifelse(y_pred >= 0.5, 1, 0)
+  
+  y_pred_val <- as.numeric(1/(1+exp(-X_valid %*% beta_hat[-1] - beta_hat[1])))
+  #y_pred_val <- ifelse(y_pred >= 0.5, 1, 0)
+  wa <- beta_hat
+
+  xb <- X_target %*% wa[-1] + wa[1]
+  xval <- X_valid %*% wa[-1] + wa[1]
+  
+  neg_log_likelihood <- as.numeric(- t(y_target) %*% xb + sum(log(1+exp(xb))))/length(y_target)
+  neg_log_likelihood_val <-as.numeric(- t(y_valid) %*% xval + sum(log(1+exp(xval))))/length(y_valid)
+  eval_metrics_target <- predict_log_img(predicted = y_pred, 
+                                     actual = y_target, 
+                                     type = NULL, 
+                                     beta_hat = beta_hat[-1], 
+                                     s =NULL, 
+                                     p =NULL,
+                                     RealDataStatus = TRUE)
+  eval_valid <- predict_log_img(predicted = y_pred_val, 
+                            actual = y_valid, 
+                            type = NULL, 
+                            beta_hat = beta_hat[-1], 
+                            s = NULL, 
+                            p = NULL,
+                            RealDataStatus = TRUE)
+  
+  return(list(beta_hat = beta_hat, 
+              loss = neg_log_likelihood, 
+              loss_valid = neg_log_likelihood_val, 
+              eval_metrics_target = eval_metrics_target, 
+              eval_metrics_valid = eval_valid))
+}
+
+
+# Trans_glm :
+Ah_Trans_GLM_Logistic_TransferLearning_img <- function(X_target, y_target, X_source, y_source, X_valid, y_valid, C0 = 0.5, seed = 202310, num_folds = 5, s = NULL, p = NULL, type = NULL, alpha = 1, family = "binomial") {
+  set.seed(seed)
+  folds <- createFolds(y_target, k = num_folds, list = TRUE, returnTrain = TRUE)
+  
+  beta_hats <- vector("list", length(X_source))
+  loss_0 <- vector("list", num_folds)
+  loss_k <- vector("list", length(X_source))
+  
+  for (fold in 1:num_folds) {
+    train_indices <- unlist(folds[fold])
+    valid_indices <- setdiff(1:length(y_target), train_indices)
+    
+    train_X <- X_target[train_indices, ]
+    train_y <- y_target[train_indices]
+    valid_X <- X_target[valid_indices, ]
+    valid_y <- y_target[valid_indices]
+
+    cv_lasso <- cv.glmnet(train_X, train_y, alpha = alpha, family = family, nfolds = num_folds)
+
+    best_lambda_w0r <- cv_lasso$lambda.min
+    lasso_bench_mark_foldr <- glmnet(train_X, train_y, alpha = alpha, family = family, lambda = best_lambda_w0r)
+    beta_hat_lasso_bench <- coef.glmnet(lasso_bench_mark_foldr, lambda = best_lambda_w0r)
+    loss_0[fold] <- calculate_neg_log_likelihood(beta_hat_lasso_bench, valid_X, valid_y)
+    
+    for (i in seq_along(X_source)) {
+      source_X <- X_source[[i]]
+      source_y <- y_source[[i]]
+      result <- run_transferring_step(source_X, source_y, train_X, train_y, valid_X, valid_y, family = family, alpha = alpha)
+
+      beta_hats[[i]][[fold]] <- result$beta_hat
+
+      temp_loss <- calculate_neg_log_likelihood(result$beta_hat, data = valid_X, actual_labels = valid_y)
+
+
+      loss_k[[i]][[fold]] <- temp_loss
+    }
+  }
+
+  loss_0_final <- mean(unlist(loss_0))
+  k_average_loss <- sapply(loss_k, function(lk) mean(unlist(lk)))
+  sigma <- sd(unlist(loss_0))
+  sigma1 <- sqrt(sum((unlist(loss_0) - loss_0_final)^2) / (num_folds - 1))
+  threshold <- loss_0_final+ C0 * max(sigma, 0.01)
+  A <- which(k_average_loss <= threshold)
+  results_ah <- Ah_trans_log_img(TransferringID = A, X_target = X_target, y_target = y_target, X_source = X_source, y_source = y_source, X_valid = X_valid, y_valid = y_valid, alpha = alpha, family = family)
+
+  
+  return(list(beta_hat = results_ah$beta_hat, selected_A = A, loss_0 = loss_0, loss_target = loss_0_final, loss_valid = results_ah$loss_valid, loss_k_source = loss_k, evaluation_metrics_target = results_ah$eval_metrics_target, evaluation_metrics_valid = results_ah$eval_metrics_valid, threshold = threshold, k_average_loss = k_average_loss))
+}
+```
+
+
+# train test read in and splittings
+```{r}
+splitXYIntoNFolds <- function(X, Y, nFolds) {
+  # Ensure the 'caret' package is available
+  if (!requireNamespace("caret", quietly = TRUE)) {
+    install.packages("caret")
+  }
+  library(caret)
+  
+  # Generate a sequence of indices for rows in X/Y
+  indices <- 1:nrow(X)
+  
+  # Create folds using the sequence of indices
+  set.seed(123) # Setting seed for reproducibility
+  folds <- createFolds(indices, k = nFolds, list = TRUE, returnTrain = TRUE)
+  
+  # Split the data based on the folds
+  folds_data <- lapply(folds, function(idx) {
+    list(
+      x = X[idx, , drop = FALSE], # Extracting rows for the fold from X
+      y = Y[idx]                  # Extracting corresponding elements from Y
+    )
+  })
+  
+  return(folds_data)
+}
+
+```
+
+```{r}
+glioma_train_split <- splitXYIntoNFolds(X, y, 5)
+```
+
+```{r}
+# Function to process a parquet file and split it into folds
+processAndSplitData <- function(file_path) {
+  # Ensure the 'arrow' package is available
+  if (!requireNamespace("arrow", quietly = TRUE)) {
+    install.packages("arrow")
+  }
+  library(arrow)
+  
+  # Read the Parquet file into an R data frame
+  df <- read_parquet(file_path)
+  
+  # Assuming 'Vector' column contains the feature vectors
+  # Step 1: Extract the vectors from the dataframe
+  X_vectors <- df$Vector
+  
+  # Step 2: Combine the vectors into a matrix
+  matrix_data <- do.call(rbind, X_vectors)
+  
+  # Convert the combined vectors into a matrix format, ensuring it's numeric
+  X <- matrix(as.numeric(matrix_data), nrow = nrow(matrix_data))
+  
+  # Assuming the response variable is the last column in the original dataframe
+  # Extract the response variable into y
+  y <- as.numeric(df[[ncol(df)]])  # Select the last column
+  
+  # Use the previously defined 'splitXYIntoNFolds' function to split the dataset
+  folds <- list(x = X, 
+                y = y)
+  
+  return(folds)
+}
+
+
+# File paths
+file_paths <- c(
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_train_labels_glioma.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_train_labels_meningioma.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_train_notumor.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_train_pituitary.parquet'
+)
+
+# Descriptive names for the datasets
+dataset_names <- c("glioma", "meningioma", "notumor", "pituitary")
+
+# Initialize a list to store the split data for each dataset
+dataset_splits <- list()
+
+# Process each dataset
+for (i in seq_along(file_paths)) {
+  # Generate a name for the processed data
+  name <- paste("train_split", dataset_names[i], sep = "_")
+  
+  # Process and split the data
+  dataset_splits[[name]] <- processAndSplitData(file_paths[i])
+}
+
+# At this point, 'dataset_splits' contains the split data for each dataset,
+# accessible with names like 'train_split_glioma', 'train_split_meningioma', etc.
+
+```
+
+```{r}
+
+# File paths
+file_paths_t <- c(
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_test_labels_glioma.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_test_labels_meningioma.parquet',
+'/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_test_pip.parquet',
+'/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/feature_vectors_test_notumor.parquet'
+)
+
+# Descriptive names for the datasets
+dataset_names_t <- c("glioma", "meningioma", "pituitary", "notumor")
+
+# Initialize a list to store the split data for each dataset
+dataset_splits_test <- list()
+
+# Process each dataset
+for (i in seq_along(file_paths_t)) {
+  # Generate a name for the processed data
+  name <- paste("test_split", dataset_names_t[i], sep = "_")
+  
+  # Process and split the data
+  dataset_splits_test[[name]] <- processAndSplitData(file_paths_t[i])
+}
+
+```
+
+# 1:9 scenario
+
+#Splitting functions
+```{r}
+sampleWithRatio <- function(data_0, data_1, n, num_sets, ratio = 9) {
+  X_0 <- data_0$x
+  Y_0 <- data_0$y
+  X_1 <- data_1$x
+  Y_1 <- data_1$y
+  
+  #check n to be multiples of 10
+  if (n %% 10 != 0) {
+    stop("The value of 'n' must be a multiple of 10.", call. = FALSE)
+  }
+  # Determine the number of samples to take from each dataset
+  n_0 <- n * ratio
+  n_1 <- n
+  
+  # Calculate total samples needed from each dataset
+  total_samples_0 <- num_sets * n_0
+  total_samples_1 <- num_sets * n_1
+  
+  if (total_samples_0 > nrow(X_0) || total_samples_1 > nrow(X_1)) {
+    stop("Not enough data to sample from without replacement.")
+  }
+  
+  # Shuffle indices and get the random sequence for all samples needed from each dataset
+  all_indices_0 <- sample(nrow(X_0), size = total_samples_0, replace = FALSE)
+  all_indices_1 <- sample(nrow(X_1), size = total_samples_1, replace = FALSE)
+  
+  # Split indices into the required number of groups for each dataset
+  sample_groups_0 <- split(all_indices_0, rep(1:num_sets, each = n_0))
+  sample_groups_1 <- split(all_indices_1, rep(1:num_sets, each = n_1))
+  
+  # Create sampled datasets from each group of indices and combine them
+  sampled_data_list <- lapply(1:num_sets, function(i) {
+    combined_x <- rbind(X_0[sample_groups_0[[i]], , drop = FALSE], 
+                        X_1[sample_groups_1[[i]], , drop = FALSE])
+    combined_y <- c(Y_0[sample_groups_0[[i]]], 
+                    Y_1[sample_groups_1[[i]]])
+    
+    # Shuffle the combined dataset to ensure random order
+    combined_indices <- sample(length(combined_y))
+    
+    list(
+      x = combined_x[combined_indices, , drop = FALSE],
+      y = combined_y[combined_indices]
+    )
+  })
+  
+  return(sampled_data_list)
+}
+
+sampleDistinctSets <- function(data, n, num_sets) {
+  X <- data$x
+  Y <- data$y
+  
+  # Calculate total samples needed
+  total_samples <- num_sets * n
+  if (total_samples > nrow(X)) {
+    stop("Not enough data to sample from without replacement.")
+  }
+  
+  # Shuffle indices to get a random sequence for all samples needed
+  all_indices <- sample(nrow(X), size = total_samples, replace = FALSE)
+  
+  # Split indices into the required number of groups
+  sample_groups <- split(all_indices, rep(1:num_sets, each = n))
+  
+  # Create sampled datasets from each group of indices
+  sampled_data_list <- lapply(sample_groups, function(indices) {
+    list(
+      x = X[indices, , drop = FALSE],
+      y = Y[indices]
+    )
+  })
+  
+  return(sampled_data_list)
+}
+
+SampleAndComplement <- function(data, n) {
+  X <- data$x
+  Y <- data$y
+  
+  # Ensure 'n' does not exceed the number of rows in the dataset
+  if (n > nrow(X)) {
+    stop("Requested sample size exceeds the number of available rows.")
+  }
+  
+  # Randomly sample 'n' indices
+  sampled_indices <- sample(1:nrow(X), size = n, replace = FALSE)
+  
+  # Determine the complement indices
+  complement_indices <- setdiff(1:nrow(X), sampled_indices)
+  
+  # Create the sampled dataset
+  sampled_dataset <- list(
+    x = X[sampled_indices, , drop = FALSE],
+    y = Y[sampled_indices]
+  )
+  
+  # Create the complement dataset
+  complement_dataset <- list(
+    x = X[complement_indices, , drop = FALSE],
+    y = Y[complement_indices]
+  )
+  
+  # Return both datasets
+  list(
+    target_prep = sampled_dataset,
+    source_prep = complement_dataset
+  )
+}
+
+extractXandY <- function(datasets) {
+  # Extracting 'x'
+  list_x <- lapply(datasets, function(dataset) dataset$x)
+  
+  # Extracting 'y'
+  list_y <- lapply(datasets, function(dataset) dataset$y)
+  
+  return(list(x = list_x, y = list_y))
+}
+
+concatenateXandY <- function(dataset1, dataset2) {
+  # Extract 'x' and 'y' from the first dataset
+  extracted1 <- extractXandY(dataset1)
+  list_x1 <- extracted1$x
+  list_y1 <- extracted1$y
+  
+  # Extract 'x' and 'y' from the second dataset
+  extracted2 <- extractXandY(dataset2)
+  list_x2 <- extracted2$x
+  list_y2 <- extracted2$y
+  
+  # Concatenate the 'x' lists and the 'y' lists from both datasets
+  concatenated_x <- c(list_x1, list_x2)
+  concatenated_y <- c(list_y1, list_y2)
+  
+  return(list(x = concatenated_x, y = concatenated_y))
+}
+
+
+```
+Pituitary as the target dataset:
+Training
+100, 10:90
+200, 20:180
+300, 30:270
+
+Test:
+100, 10:90
+200, 20:180
+300, 30:270
+
+Source: K = 2,4,8,16?
+200 Glioma
+200 Meninglioma
+
+2 sets of 200 glio
+2 sets of 200 mening
+
+4 sets of 200 glio
+4 sets of 200 mening
+
+5 sets of 200 glio
+5 sets of 200 mening
+```{r}
+
+
+
+target_source_no_tumor <- SampleAndComplement(dataset_splits$train_split_notumor, 200)
+target_0_data <- target_source_no_tumor$target_prep
+target_1_data <- dataset_splits$train_split_pituitary
+
+target_pit_100 <- sampleWithRatio(target_0_data, target_1_data, 10, 2, 9)
+
+
+target_pit <- sampleDistinctSets(target_0_data, pit_indices$target_prep, 10, 2)
+
+source_0_data <- SampleAndComplement(target_source_no_tumor$source_prep, floor(nrow(target_source_no_tumor$source_prep$x)/2))
+source_mening <- sampleWithRatio(source_0_data$target_prep, dataset_splits$train_split_meningioma, 20, 2, 9)
+source_glioma <- sampleWithRatio(source_0_data$source_prep, dataset_splits$train_split_glioma, 20, 2, 9)
+
+extractXandY <- function(datasets) {
+  # Extracting 'x'
+  list_x <- lapply(datasets, function(dataset) dataset$x)
+  
+  # Extracting 'y'
+  list_y <- lapply(datasets, function(dataset) dataset$y)
+  
+  return(list(x = list_x, y = list_y))
+}
+
+concatenateXandY <- function(dataset1, dataset2) {
+  # Extract 'x' and 'y' from the first dataset
+  extracted1 <- extractXandY(dataset1)
+  list_x1 <- extracted1$x
+  list_y1 <- extracted1$y
+  
+  # Extract 'x' and 'y' from the second dataset
+  extracted2 <- extractXandY(dataset2)
+  list_x2 <- extracted2$x
+  list_y2 <- extracted2$y
+  
+  # Concatenate the 'x' lists and the 'y' lists from both datasets
+  concatenated_x <- c(list_x1, list_x2)
+  concatenated_y <- c(list_y1, list_y2)
+  
+  return(list(x = concatenated_x, y = concatenated_y))
+}
+
+
+source_1 <- concatenateXandY(source_glioma, source_mening)
+```
+
+# K =1 and K =2
+
+```{r}
+results_trans_logit <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100[[1]]$x, y_target = target_pit_100[[1]]$y , X_source = source_1$x, y_source = source_1$y, X_valid = target_pit_100[[2]]$x, y_valid = target_pit_100[[2]]$y, C0 = 0.5, seed = 202310, num_folds = 5, s = NULL, p = NULL, type = NULL, alpha = 1, family = "binomial")
+
+  
+```
+
+
+# ratio 1:1 or 50 50
+```{r}
+target_source_no_tumor <- SampleAndComplement(dataset_splits$train_split_notumor, 200)
+target_0_data <- target_source_no_tumor$target_prep
+target_1_data <- dataset_splits$train_split_pituitary
+
+target_pit_100 <- sampleWithRatio(target_0_data, target_1_data, 50, 2, 1)
+
+
+source_0_data <- SampleAndComplement(target_source_no_tumor$source_prep, floor(nrow(target_source_no_tumor$source_prep$x)/2))
+source_mening <- sampleWithRatio(source_0_data$target_prep, dataset_splits$train_split_meningioma, 50, 2, 1)
+source_glioma <- sampleWithRatio(source_0_data$source_prep, dataset_splits$train_split_glioma, 50, 2, 1)
+
+
+source_1 <- concatenateXandY(source_glioma, source_mening)
+```
+
+# K =1 and K =2
+
+```{r}
+
+results_trans_logitk4 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100[[1]]$x, y_target = target_pit_100[[1]]$y , X_source = source_1$x, y_source = source_1$y, X_valid = target_pit_100[[2]]$x, y_valid = target_pit_100[[2]]$y, C0 = 0.5, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+results_pooled_lasso_img <- pooled_lasso_logistic_img(X_target = target_pit_100[[1]]$x, y_target = target_pit_100[[1]]$y , X_source = source_1$x, y_source = source_1$y, X_valid = target_pit_100[[2]]$x, y_valid = target_pit_100[[2]]$y, alpha = 1, family = "binomial")
+```
+
+
+```{r}
+x_source <- source_1$x[-c(2:3)]
+y_source <- source_1$y[-c(2:3)]
+
+results_trans_logit_k2 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100[[1]]$x, y_target = target_pit_100[[1]]$y , X_source = x_source, y_source = y_source, X_valid = target_pit_100[[2]]$x, y_valid = target_pit_100[[2]]$y, C0 = 0.5, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+
+target_source_no_tumor_test <- SampleAndComplement(dataset_splits_test$test_split_notumor, 200)
+target_0_data_test <- target_source_no_tumor_test$target_prep
+target_1_data_test <- dataset_splits_test$test_split_pituitary
+
+target_pit_100_test <- sampleWithRatio(target_0_data_test, target_1_data_test, 50, 2, 1)
+
+results_trans_logit_k2_t <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100[[1]]$x, y_target = target_pit_100[[1]]$y , X_source = x_source, y_source = y_source, X_valid = target_pit_100_test[[1]]$x, y_valid = target_pit_100_test[[1]]$y, C0 = 0.5, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+results_pooled_lasso_img_test <- pooled_lasso_logistic_img(X_target = target_pit_100[[1]]$x, y_target = target_pit_100[[1]]$y , X_source = source_1$x, y_source = source_1$y, X_valid = target_pit_100_test[[1]]$x, y_valid = target_pit_100_test[[1]]$y, alpha = 1, family = "binomial")
+
+```
+
+
+
+
+# for all sets lets try 2 sets of 1:9 and 5 : 5 
+
+# Simple Manual Vectors
+
+# train test read in and splittings
+```{r}
+
+# File paths
+file_paths_man <- c(
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/gliomasimttrain_feature_vectors.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/meningiomasimttrain_feature_vectors.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/pituitarysimttrain_feature_vectors.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/notumorsimttrain_feature_vectors.parquet'
+)
+
+# Descriptive names for the datasets
+dataset_names_man <- c("glioma", "meningioma", "notumor", "pituitary")
+
+# Initialize a list to store the split data for each dataset
+dataset_splits_man <- list()
+
+# Process each dataset
+for (i in seq_along(file_paths_man)) {
+  # Generate a name for the processed data
+  name <- paste("train_split", dataset_names_man[i], sep = "_")
+  
+  # Process and split the data
+  dataset_splits_man[[name]] <- processAndSplitData(file_paths_man[i])
+}
+
+# At this point, 'dataset_splits' contains the split data for each dataset,
+# accessible with names like 'train_split_glioma', 'train_split_meningioma', etc.
+
+```
+
+```{r}
+
+# File paths
+file_paths_man_t <- c(
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/gliomasimtest_feature_vectors.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/meningiomasimtest_feature_vectors.parquet',
+'/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/pituitarysimtest_feature_vectors.parquet',
+'/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/notumorsimtest_feature_vectors.parquet'
+)
+
+# Descriptive names for the datasets
+dataset_names_man_t <- c("glioma", "meningioma", "pituitary", "notumor")
+
+# Initialize a list to store the split data for each dataset
+dataset_splits_man_test <- list()
+
+# Process each dataset
+for (i in seq_along(file_paths_man_t)) {
+  # Generate a name for the processed data
+  name <- paste("test_split_simV", dataset_names_t[i], sep = "_")
+  
+  # Process and split the data
+  dataset_splits_man_test[[name]] <- processAndSplitData(file_paths_man_t[i])
+}
+
+```
+
+# ratio 1:1 or 50 50
+```{r}
+target_source_no_tumorM <- SampleAndComplement(dataset_splits_man$train_split_notumor, 200)
+target_0_dataM <- target_source_no_tumorM$target_prep
+target_1_dataM <- dataset_splits_man$train_split_pituitary
+
+target_pit_100M <- sampleWithRatio(target_0_dataM, target_1_dataM, 50, 2, 1)
+
+```
+# K = 2
+```{r}
+source_0_dataM2 <- SampleAndComplement(target_source_no_tumorM$source_prep, floor(nrow(target_source_no_tumorM$source_prep$x)/2))
+source_meningM2 <- sampleWithRatio(source_0_dataM2$target_prep, dataset_splits_man$train_split_meningioma, 50, 1, 1)
+source_gliomaM2 <- sampleWithRatio(source_0_dataM2$source_prep, dataset_splits_man$train_split_glioma, 50, 1, 1)
+
+
+source_1M2 <- concatenateXandY(source_gliomaM2, source_meningM2)
+
+Mresults_trans_logit_k2_M2 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M2$x, y_source = source_1M2$y, X_valid = target_pit_100_testM[[2]]$x, y_valid = target_pit_100_testM[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img_testM2 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M2$x, y_source = source_1M2$y, X_valid = target_pit_100_testM[[2]]$x, y_valid = target_pit_100_testM[[2]]$y, alpha = 1, family = "binomial")
+
+Mresults_naive_lasso_img2 <- naive_lasso(target_pit_100M[[1]]$x, target_pit_100M[[1]]$y , target_pit_100_testM[[1]]$x, target_pit_100_testM[[1]]$y)
+```
+
+
+```{r}
+x_sourceM <- source_1M$x[-c(2:3)]
+y_sourceM <- source_1M$y[-c(2:3)]
+
+Mresults_trans_logit_k2M <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = x_sourceM, y_source = y_sourceM, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+
+target_source_no_tumor_testM <- SampleAndComplement(dataset_splits_man_test$test_split_simV_notumor, 200)
+
+target_0_data_testM <- target_source_no_tumor_testM$target_prep
+target_1_data_testM <- dataset_splits_man_test$test_split_simV_pituitary
+
+target_pit_100_testM <- sampleWithRatio(target_0_data_testM, target_1_data_testM, 50, 2, 1)
+
+Mresults_trans_logit_k2_tM <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = x_sourceM, y_source = y_sourceM, X_valid = target_pit_100_testM[[1]]$x, y_valid = target_pit_100_testM[[1]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img2 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = x_sourceM, y_source = y_sourceM, X_valid = target_pit_100_testM[[1]]$x, y_valid = target_pit_100_testM[[1]]$y, alpha = 1, family = "binomial")
+
+```
+# K = 4
+```{r}
+source_0_dataM <- SampleAndComplement(target_source_no_tumorM$source_prep, floor(nrow(target_source_no_tumorM$source_prep$x)/2))
+source_meningM <- sampleWithRatio(source_0_dataM$target_prep, dataset_splits_man$train_split_meningioma, 50, 2, 1)
+source_gliomaM <- sampleWithRatio(source_0_dataM$source_prep, dataset_splits_man$train_split_glioma, 50, 2, 1)
+
+
+source_1M <- concatenateXandY(source_gliomaM, source_meningM)
+```
+
+
+
+```{r}
+
+Mresults_trans_logitk4 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M$x, y_source = source_1M$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 0.5, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img4 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M$x, y_source = source_1M$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, alpha = 1, family = "binomial")
+```
+
+
+```{r}
+x_sourceM <- source_1M$x[-c(2:3)]
+y_sourceM <- source_1M$y[-c(2:3)]
+
+results_trans_logit_k2M <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = x_sourceM, y_source = y_sourceM, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+
+target_source_no_tumor_testM <- SampleAndComplement(dataset_splits_man_test$test_split_simV_notumor, 200)
+
+target_0_data_testM <- target_source_no_tumor_testM$target_prep
+target_1_data_testM <- dataset_splits_man_test$test_split_simV_pituitary
+
+target_pit_100_testM <- sampleWithRatio(target_0_data_testM, target_1_data_testM, 50, 2, 1)
+
+results_trans_logit_k2_tM <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = x_sourceM, y_source = y_sourceM, X_valid = target_pit_100_testM[[1]]$x, y_valid = target_pit_100_testM[[1]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+results_pooled_lasso_img_testM2 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = x_sourceM, y_source = y_sourceM, X_valid = target_pit_100_testM[[1]]$x, y_valid = target_pit_100_testM[[1]]$y, alpha = 1, family = "binomial")
+
+```
+# k = 8
+
+
+```{r}
+# target_source_no_tumorM <- SampleAndComplement(dataset_splits_man$train_split_notumor, 200)
+# target_0_dataM <- target_source_no_tumorM$target_prep
+# target_1_dataM <- dataset_splits_man$train_split_pituitary
+# 
+# target_pit_100M <- sampleWithRatio(target_0_dataM, target_1_dataM, 50, 2, 1)
+
+
+source_0_dataM8 <- SampleAndComplement(target_source_no_tumorM$source_prep, floor(nrow(target_source_no_tumorM$source_prep$x)/2))
+source_meningM8 <- sampleWithRatio(source_0_dataM8$target_prep, dataset_splits_man$train_split_meningioma, 50, 4, 1)
+source_gliomaM8 <- sampleWithRatio(source_0_dataM8$source_prep, dataset_splits_man$train_split_glioma, 50, 4, 1)
+  
+
+source_1M8 <- concatenateXandY(source_gliomaM8, source_meningM8)
+```
+#K =6
+```{r}
+source_0_dataM6 <- SampleAndComplement(target_source_no_tumorM$source_prep, floor(nrow(target_source_no_tumorM$source_prep$x)/2))
+source_meningM6 <- sampleWithRatio(source_0_dataM6$target_prep, dataset_splits_man$train_split_meningioma, 50, 3, 1)
+source_gliomaM6 <- sampleWithRatio(source_0_dataM6$source_prep, dataset_splits_man$train_split_glioma, 50, 3, 1)
+  
+
+source_1M6 <- concatenateXandY(source_gliomaM6, source_meningM6)
+```
+# K =6
+
+```{r}
+
+Mresults_trans_logitk6 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M6$x, y_source = source_1M6$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img6 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M6$x, y_source = source_1M6$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, alpha = 1, family = "binomial")
+
+```
+
+# K =8
+
+```{r}
+
+Mresults_trans_logitk8 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M8$x, y_source = source_1M8$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img8 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M8$x, y_source = source_1M8$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, alpha = 1, family = "binomial")
+
+```
+
+# K = 10
+```{r}
+source_0_dataM10 <- SampleAndComplement(target_source_no_tumorM$source_prep, floor(nrow(target_source_no_tumorM$source_prep$x)/2))
+source_meningM10 <- sampleWithRatio(source_0_dataM10$target_prep, dataset_splits_man$train_split_meningioma, 50, 5, 1)
+source_gliomaM10 <- sampleWithRatio(source_0_dataM10$source_prep, dataset_splits_man$train_split_glioma, 50, 5, 1)
+
+
+source_1M10 <- concatenateXandY(source_gliomaM10, source_meningM10)
+```
+
+```{r}
+
+Mresults_trans_logitk10 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M10$x, y_source = source_1M10$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img10 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M10$x, y_source = source_1M10$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, alpha = 1, family = "binomial")
+
+```
+# Plotting results:
+
+```{r}
+
+K_vals <- c(2,4,6,8,10)
+
+Pooled_LassoAcc <- c(0.77, 0.7, 0.64, 0.5, 0.5)
+
+Trans_logit <- c(0.89, 0.84,0.86, 0.85, 0.81)
+
+Naive_lasso <- c(0.87, 0.87, 0.87, 0.87, 0.87)
+#connot converge in glmnet and cannot converge for the 1st lambda as shown by r console warnings
+# real datasets also face chanllenges when it is not close to the target test datasets, as sometimes less source is better in the case where two sources achieved 0.89 which is better than other 
+
+# Create a data frame
+data <- data.frame(
+  K_vals = rep(K_vals, times = 3),
+  Accuracy = c(Pooled_LassoAcc, Trans_logit, Naive_lasso),
+  Method = factor(rep(c("Pooled_Lasso", "Trans_logit", "Naive_lasso"), each = length(K_vals)))
+)
+
+# Plot
+p <- ggplot(data, aes(x = K_vals, y = Accuracy, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "green")) +
+  theme_minimal() +
+  labs(title = "Accuracy Trend by K Values", x = "K Values", y = "Accuracy")
+
+# Save the plot
+ggsave("/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/accuracy_trend.pdf", plot = p, width = 8, height = 5, dpi = 600, device = "pdf")
+p
+```
+
+
+
+```{r}
+
+K_vals <- c(2,4,6,8,10)
+
+Pooled_LassoFNR <- c(0.46, 0.6, 0.6, 0.72, 0.595)
+# mean(c(0.46, 0.6, 0.6, 0.72))
+Trans_logitFNR <- c(0.89, 0.84,0.86, 0.85, 0.81)
+
+Naive_lassoFNR <- c(0.87, 0.87, 0.87, 0.87, 0.87)
+#connot converge in glmnet and cannot converge for the 1st lambda as shown by r console warnings
+# real datasets also face chanllenges when it is not close to the target test datasets, as sometimes less source is better in the case where two sources achieved 0.89 which is better than other 
+
+# Create a data frame
+data <- data.frame(
+  K_vals = rep(K_vals, times = 3),
+  Accuracy = c(Pooled_LassoAcc, Trans_logit, Naive_lasso),
+  Method = factor(rep(c("Pooled_Lasso", "Trans_logit", "Naive_lasso"), each = length(K_vals)))
+)
+
+# Plot
+p <- ggplot(data, aes(x = K_vals, y = Accuracy, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "green")) +
+  theme_minimal() +
+  labs(title = "Accuracy Trend by K Values", x = "K Values", y = "Accuracy")
+
+# Save the plot
+ggsave("/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/accuracy_trend.pdf", plot = p, width = 8, height = 5, dpi = 600, device = "pdf")
+p
+```
+
+
+
 
