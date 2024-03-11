@@ -1212,6 +1212,9 @@ Mresults_trans_logitk8 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = 
 
 Mresults_pooled_lasso_img8 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M8$x, y_source = source_1M8$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, alpha = 1, family = "binomial")
 
+Mresults_trans_logitk8C1 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M8$x, y_source = source_1M8$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 1, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+
 ```
 
 # K = 10
@@ -1231,7 +1234,215 @@ Mresults_trans_logitk10 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target =
 Mresults_pooled_lasso_img10 <- pooled_lasso_logistic_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M10$x, y_source = source_1M10$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, alpha = 1, family = "binomial")
 
 ```
-# Plotting results:
+
+
+#VGG16
+# train test read in and splittings
+```{r}
+
+# File paths
+file_paths_VGG <- c(
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/gliomavggtrain_feature_vectors.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/meningiomavggtrain_feature_vectors.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/pituitaryvggtrain_feature_vectors.parquet',
+  '/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/notumorvggtrain_feature_vectors.parquet'
+)
+
+# Descriptive names for the datasets
+dataset_names_VGG <- c("glioma", "meningioma", "notumor", "pituitary")
+
+# Initialize a list to store the split data for each dataset
+dataset_splits_VGG <- list()
+
+# Process each dataset
+for (i in seq_along(file_paths_VGG)) {
+  # Generate a name for the processed data
+  name <- paste("train_split", dataset_names_VGG[i], sep = "_")
+  
+  # Process and split the data
+  dataset_splits_VGG[[name]] <- processAndSplitData(file_paths_VGG[i])
+}
+
+# At this point, 'dataset_splits' contains the split data for each dataset,
+# accessible with names like 'train_split_glioma', 'train_split_meningioma', etc.
+
+```
+
+```{r}
+
+# File paths
+file_paths_VGG_t <- c(
+'/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/pituitarysimtest_feature_vectors.parquet',
+'/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/notumorsimtest_feature_vectors.parquet'
+)
+
+# Descriptive names for the datasets
+dataset_names_VGG_t <- c("pituitary", "notumor")
+
+# Initialize a list to store the split data for each dataset
+dataset_splits_VGG_test <- list()
+
+# Process each dataset
+for (i in seq_along(file_paths_VGG_t)) {
+  # Generate a name for the processed data
+  name <- paste("test_split_simV", dataset_names_VGG_t[i], sep = "_")
+  
+  # Process and split the data
+  dataset_splits_VGG_test[[name]] <- processAndSplitData(file_paths_VGG_t[i])
+}
+
+```
+
+# ratio 1:1 or 50 50
+```{r}
+target_source_no_tumorV <- SampleAndComplement(dataset_splits_VGG$train_split_notumor, 200)
+target_0_dataV <- target_source_no_tumorV$target_prep
+target_1_dataV <- dataset_splits_VGG$train_split_pituitary
+
+target_pit_100V <- sampleWithRatio(target_0_dataV, target_1_dataV, 50, 2, 1)
+
+```
+# K = 2
+```{r}
+source_0_dataV2 <- SampleAndComplement(target_source_no_tumorV$source_prep, floor(nrow(target_source_no_tumorV$source_prep$x)/2))
+source_meningV2 <- sampleWithRatio(source_0_dataV2$target_prep, dataset_splits_VGG$train_split_meningioma, 50, 1, 1)
+source_gliomaV2 <- sampleWithRatio(source_0_dataV2$source_prep, dataset_splits_VGG$train_split_glioma, 50, 1, 1)
+
+
+source_1V2 <- concatenateXandY(source_gliomaV2, source_meningV2)
+
+target_source_no_tumor_testV <- SampleAndComplement(dataset_splits_VGG_test$test_split_simV_notumor, 200)
+
+target_0_data_testV <- target_source_no_tumor_testV$target_prep
+target_1_data_testV <- dataset_splits_VGG_test$test_split_simV_pituitary
+
+target_pit_100_testV <- sampleWithRatio(target_0_data_testV, target_1_data_testV, 50, 2, 1)
+
+Mresults_trans_logit_k2_V2 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V2$x, y_source = source_1V2$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img_testV2 <- pooled_lasso_logistic_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V2$x, y_source = source_1V2$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, alpha = 1, family = "binomial")
+
+Mresults_naive_lasso_imgV2 <- naive_lasso(target_pit_100V[[1]]$x, target_pit_100V[[1]]$y , target_pit_100V[[2]]$x, target_pit_100V[[2]]$y)
+```
+
+
+```{r}
+x_sourceV <- source_1V2$x[-c(2:3)]
+y_sourceV <- source_1V2$y[-c(2:3)]
+
+Mresults_trans_logit_k2V <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = x_sourceV, y_source = y_sourceV, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+
+
+
+# Mresults_trans_logit_k2_t <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = x_sourceM, y_source = y_sourceM, X_valid = target_pit_100_testM[[1]]$x, y_valid = target_pit_100_testM[[1]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img2V <- pooled_lasso_logistic_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = x_sourceV, y_source = y_sourceV, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, alpha = 1, family = "binomial")
+
+```
+# K = 4
+```{r}
+source_0_dataV <- SampleAndComplement(target_source_no_tumorV$source_prep, floor(nrow(target_source_no_tumorV$source_prep$x)/2))
+source_meningV <- sampleWithRatio(source_0_dataV$target_prep, dataset_splits_VGG$train_split_meningioma, 50, 2, 1)
+source_gliomaV <- sampleWithRatio(source_0_dataV$source_prep, dataset_splits_VGG$train_split_glioma, 50, 2, 1)
+
+
+source_1V <- concatenateXandY(source_gliomaV, source_meningV)
+```
+
+
+
+```{r}
+
+Mresults_trans_logitk4V <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V$x, y_source = source_1V$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, C0 = 0.5, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img4V <- pooled_lasso_logistic_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V$x, y_source = source_1V$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, alpha = 1, family = "binomial")
+```
+
+
+```{r}
+
+target_source_no_tumor_testV <- SampleAndComplement(dataset_splits_VGG_test$test_split_simV_notumor, 200)
+
+target_0_data_testV <- target_source_no_tumor_testV$target_prep
+target_1_data_testV <- dataset_splits_VGG_test$test_split_simV_pituitary
+
+target_pit_100_testV <- sampleWithRatio(target_0_data_testV, target_1_data_testV, 50, 2, 1)
+
+results_trans_logit_k2_tV <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = x_sourceV, y_source = y_sourceV, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+results_pooled_lasso_img_testV2 <- pooled_lasso_logistic_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = x_sourceV, y_source = y_sourceV, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, alpha = 1, family = "binomial")
+
+```
+# k = 8
+
+
+```{r}
+# target_source_no_tumorM <- SampleAndComplement(dataset_splits_man$train_split_notumor, 200)
+# target_0_dataM <- target_source_no_tumorM$target_prep
+# target_1_dataM <- dataset_splits_man$train_split_pituitary
+# 
+# target_pit_100M <- sampleWithRatio(target_0_dataM, target_1_dataM, 50, 2, 1)
+
+
+source_0_dataV8 <- SampleAndComplement(target_source_no_tumorV$source_prep, floor(nrow(target_source_no_tumorV$source_prep$x)/2))
+source_meningV8 <- sampleWithRatio(source_0_dataV8$target_prep, dataset_splits_VGG$train_split_meningioma, 50, 4, 1)
+source_gliomaV8 <- sampleWithRatio(source_0_dataV8$source_prep, dataset_splits_VGG$train_split_glioma, 50, 4, 1)
+  
+
+source_1V8 <- concatenateXandY(source_gliomaV8, source_meningV8)
+```
+#K =6
+```{r}
+source_0_dataV6 <- SampleAndComplement(target_source_no_tumorV$source_prep, floor(nrow(target_source_no_tumorV$source_prep$x)/2))
+source_meningV6 <- sampleWithRatio(source_0_dataV6$target_prep, dataset_splits_VGG$train_split_meningioma, 50, 3, 1)
+source_gliomaV6 <- sampleWithRatio(source_0_dataV6$source_prep, dataset_splits_VGG$train_split_glioma, 50, 3, 1)
+  
+
+source_1V6 <- concatenateXandY(source_gliomaV6, source_meningV6)
+```
+# K =6
+
+```{r}
+
+Mresults_trans_logitk6V <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V6$x, y_source = source_1V6$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img6V <- pooled_lasso_logistic_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V6$x, y_source = source_1V6$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, alpha = 1, family = "binomial")
+
+```
+
+# K =8
+
+```{r}
+
+Mresults_trans_logitk8V <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V8$x, y_source = source_1V8$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img8V <- pooled_lasso_logistic_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V8$x, y_source = source_1V8$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, alpha = 1, family = "binomial")
+
+# Mresults_trans_logitk8C1 <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100M[[1]]$x, y_target = target_pit_100M[[1]]$y , X_source = source_1M8$x, y_source = source_1M8$y, X_valid = target_pit_100M[[2]]$x, y_valid = target_pit_100M[[2]]$y, C0 = 1, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+
+```
+
+# K = 10
+```{r}
+source_0_dataV10 <- SampleAndComplement(target_source_no_tumorV$source_prep, floor(nrow(target_source_no_tumorV$source_prep$x)/2))
+source_meningV10 <- sampleWithRatio(source_0_dataV10$target_prep, dataset_splits_VGG$train_split_meningioma, 50, 5, 1)
+source_gliomaV10 <- sampleWithRatio(source_0_dataV10$source_prep, dataset_splits_VGG$train_split_glioma, 50, 5, 1)
+
+
+source_1V10 <- concatenateXandY(source_gliomaV10, source_meningV10)
+```
+
+```{r}
+
+Mresults_trans_logitk10V <- Ah_Trans_GLM_Logistic_TransferLearning_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V10$x, y_source = source_1V10$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, C0 = 0.2, seed = 202310, num_folds = 5, alpha = 1, family = "binomial")
+
+Mresults_pooled_lasso_img10V <- pooled_lasso_logistic_img(X_target = target_pit_100V[[1]]$x, y_target = target_pit_100V[[1]]$y , X_source = source_1V10$x, y_source = source_1V10$y, X_valid = target_pit_100V[[2]]$x, y_valid = target_pit_100V[[2]]$y, alpha = 1, family = "binomial")
+
+```
+
+# Plotting results VGG coNVERSION:
 
 ```{r}
 
@@ -1265,17 +1476,169 @@ ggsave("/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/accuracy_trend.p
 p
 ```
 
+```{r}
+pooled_resultsV <- list(Mresults_pooled_lasso_img2V, Mresults_pooled_lasso_img4V, Mresults_pooled_lasso_img6V, Mresults_pooled_lasso_img8V, Mresults_pooled_lasso_img10V)
+Pooled_lasso_f1V <- lapply(pooled_resultsV, function(results){
+  results$evaluation_metrics$f1_score[1]
+})
 
+translogit_resultsV <- list(Mresults_trans_logit_k2V, Mresults_trans_logitk4V, Mresults_trans_logitk6V, Mresults_trans_logitk8V, Mresults_trans_logitk10V)
+
+translogit_f1V <- lapply(translogit_resultsV, function(results){
+  results$evaluation_metrics_valid$f1_score[1]
+})
+
+# Convert the list of named numbers to a simple numeric vector
+Pooled_lasso_f1V <- sapply(Pooled_lasso_f1V, `[[`, "F1")
+translogit_f1V <- sapply(translogit_f1V, `[[`, "F1")
+
+# Combine the F1 scores into a single vector and repeat the K_vals for each method
+combined_F1V <- c(Pooled_lasso_f1V, translogit_f1V)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataF1V <- data.frame(
+  K_vals = K_vals_repeated,
+  F1_score = combined_F1V,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(dataF1V, aes(x = K_vals, y = F1_score, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "F1 Score Trend by K Values", x = "K Values", y = "F1 Score") +
+  theme(legend.title = element_blank())
+
+```
+
+```{r}
+Pooled_lasso_fnrV <- lapply(pooled_resultsV, function(results) {
+  results$evaluation_metrics$fnr[1]  # Assuming 'fnr' is stored here
+})
+
+translogit_fnrV <- lapply(translogit_resultsV, function(results) {
+  results$evaluation_metrics_valid$fnr[1]  # Assuming 'fnr' for translogit is stored under 'evaluation_metrics_valid'
+})
+
+# Convert the list of named numbers to a simple numeric vector, assuming "Sensitivity" is the correct name
+Pooled_lasso_fnrV <- sapply(Pooled_lasso_fnrV, `[[`, "Sensitivity")
+translogit_fnrV <- sapply(translogit_fnrV, `[[`, "Sensitivity")
+
+# Combine the FNR scores into a single vector and repeat the K_vals for each method
+combined_fnrV <- c(Pooled_lasso_fnrV, translogit_fnrV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataFNRV <- data.frame(
+  K_vals = K_vals_repeated,
+  FNR = combined_fnrV,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(dataFNRV, aes(x = K_vals, y = FNR, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "FNR Trend by K Values", x = "K Values", y = "FNR") +
+  theme(legend.title = element_blank())
+```
+
+```{r}
+# Adjustments for extracting Recall (Sensitivity)
+Pooled_lasso_recallV <- lapply(pooled_resultsV, function(result) {
+  result$evaluation_metrics$recall[1]  # Change 'fnr' to 'recall' if that's the correct field
+})
+
+translogit_recallV <- lapply(translogit_resultsV, function(result) {
+  result$evaluation_metrics_valid$recall[1]  # Assuming 'recall' is under 'evaluation_metrics_valid'
+})
+
+# Convert the list of named numbers to a simple numeric vector
+Pooled_lasso_recallV <- sapply(Pooled_lasso_recallV, `[[`, "Sensitivity")  # Use the correct key if it's labeled as "Sensitivity"
+translogit_recallV <- sapply(translogit_recallV, `[[`, "Sensitivity")
+
+# Ensure that Pooled_lasso_recall and translogit_recall are numeric vectors
+# and address any potential naming discrepancies in the data extraction phase
+
+# Combine the Recall scores into a single vector and repeat the K_vals for each method
+combined_recallV <- c(Pooled_lasso_recallV, translogit_recallV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataRecallV <- data.frame(
+  K_vals = K_vals_repeated,
+  Recall = combined_recallV,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+ggplot(dataRecallV, aes(x = K_vals, y = Recall, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "Recall (Sensitivity) Trend by K Values", x = "K Values", y = "Recall") +
+  theme(legend.title = element_blank())
+
+```
+```{r}
+# Adjustments for extracting Recall (Sensitivity)
+Pooled_lasso_ACCV <- lapply(pooled_resultsV, function(result) {
+  result$evaluation_metrics$accuracy[1]  # Change 'fnr' to 'recall' if that's the correct field
+})
+
+translogit_ACCV <- lapply(translogit_resultsV, function(result) {
+  result$evaluation_metrics_valid$accuracy[1]  # Assuming 'recall' is under 'evaluation_metrics_valid'
+})
+
+# Convert the list of named numbers to a simple numeric vector
+Pooled_lasso_ACCV <- sapply(Pooled_lasso_ACCV, `[[`, "Accuracy")  # Use the correct key if it's labeled as "Sensitivity"
+translogit_ACCV <- sapply(translogit_ACCV, `[[`, "Accuracy")
+
+# Ensure that Pooled_lasso_recall and translogit_recall are numeric vectors
+# and address any potential naming discrepancies in the data extraction phase
+
+# Combine the Recall scores into a single vector and repeat the K_vals for each method
+combined_ACCV <- c(Pooled_lasso_ACCV, translogit_ACCV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataACCV <- data.frame(
+  K_vals = K_vals_repeated,
+  Recall = combined_ACCV,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+ggplot(dataACCV, aes(x = K_vals, y = Recall, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "Accuracy Trend by K Values", x = "K Values", y = "Aaccuracy") +
+  theme(legend.title = element_blank())
+```
+
+# Plotting results mANUAL coNVERSION:
 
 ```{r}
 
 K_vals <- c(2,4,6,8,10)
 
-Pooled_LassoFNR <- c(0.46, 0.6, 0.6, 0.72, 0.595)
-# mean(c(0.46, 0.6, 0.6, 0.72))
-Trans_logitFNR <- c(0.89, 0.84,0.86, 0.85, 0.81)
+Pooled_LassoAcc <- c(0.77, 0.7, 0.64, 0.5, 0.5)
 
-Naive_lassoFNR <- c(0.87, 0.87, 0.87, 0.87, 0.87)
+translogit_ACC <- c(0.89, 0.84,0.86, 0.85, 0.81)
+
+Naive_lasso <- c(0.87, 0.87, 0.87, 0.87, 0.87)
 #connot converge in glmnet and cannot converge for the 1st lambda as shown by r console warnings
 # real datasets also face chanllenges when it is not close to the target test datasets, as sometimes less source is better in the case where two sources achieved 0.89 which is better than other 
 
@@ -1298,6 +1661,453 @@ p <- ggplot(data, aes(x = K_vals, y = Accuracy, group = Method, color = Method, 
 ggsave("/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/accuracy_trend.pdf", plot = p, width = 8, height = 5, dpi = 600, device = "pdf")
 p
 ```
+
+```{r}
+pooled_results <- list(Mresults_pooled_lasso_img2, Mresults_pooled_lasso_img4, Mresults_pooled_lasso_img6, Mresults_pooled_lasso_img8, Mresults_pooled_lasso_img10)
+Pooled_lasso_f1 <- lapply(pooled_results, function(results){
+  results$evaluation_metrics$f1_score[1]
+})
+
+translogit_results <- list(Mresults_trans_logit_k2M, Mresults_trans_logitk4, Mresults_trans_logitk6, Mresults_trans_logitk8, Mresults_trans_logitk10)
+
+translogit_f1 <- lapply(translogit_results, function(results){
+  results$evaluation_metrics_valid$f1_score[1]
+})
+
+# Convert the list of named numbers to a simple numeric vector
+Pooled_lasso_f1 <- sapply(Pooled_lasso_f1, `[[`, "F1")
+translogit_f1 <- sapply(translogit_f1, `[[`, "F1")
+
+# Combine the F1 scores into a single vector and repeat the K_vals for each method
+combined_F1 <- c(Pooled_lasso_f1, translogit_f1)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataF1 <- data.frame(
+  K_vals = K_vals_repeated,
+  F1_score = combined_F1,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(dataF1, aes(x = K_vals, y = F1_score, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "F1 Score Trend by K Values", x = "K Values", y = "F1 Score") +
+  theme(legend.title = element_blank())
+
+```
+```{r}
+Pooled_lasso_fnr <- lapply(pooled_results, function(results) {
+  results$evaluation_metrics$fnr[1]  # Assuming 'fnr' is stored here
+})
+translogit_results <- list(Mresults_trans_logit_k2M, Mresults_trans_logitk4, Mresults_trans_logitk6, Mresults_trans_logitk8, Mresults_trans_logitk10)
+translogit_fnr <- lapply(translogit_results, function(results) {
+  results$evaluation_metrics_valid$fnr[1]  # Assuming 'fnr' for translogit is stored under 'evaluation_metrics_valid'
+})
+
+# Convert the list of named numbers to a simple numeric vector, assuming "Sensitivity" is the correct name
+Pooled_lasso_fnr <- sapply(Pooled_lasso_fnr, `[[`, "Sensitivity")
+translogit_fnr <- sapply(translogit_fnr, `[[`, "Sensitivity")
+
+# Combine the FNR scores into a single vector and repeat the K_vals for each method
+combined_fnr <- c(Pooled_lasso_fnr, translogit_fnr)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataFNR <- data.frame(
+  K_vals = K_vals_repeated,
+  FNR = combined_fnr,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(dataFNR, aes(x = K_vals, y = FNR, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "FNR Trend by K Values", x = "K Values", y = "FNR") +
+  theme(legend.title = element_blank())
+```
+
+
+```{r}
+
+K_vals <- c(2,4,6,8,10)
+
+Pooled_LassoFNR <- c(0.46, 0.6, 0.6, 0.72, 0.595)
+# mean(c(0.46, 0.6, 0.6, 0.72))
+Trans_logitFNR <- c(0.89, 0.84,0.86, 0.85, 0.81)
+
+Naive_lassoFNR <- c(0.87, 0.87, 0.87, 0.87, 0.87)
+#connot converge in glmnet and cannot converge for the 1st lambda as shown by r console warnings
+# real datasets also face chanllenges when it is not close to the target test datasets, as sometimes less source is better in the case where two sources achieved 0.89 which is better than other 
+
+# Create a data frame
+data <- data.frame(
+  K_vals = rep(K_vals, times = 3),
+  Accuracy = c(Pooled_LassoFNR, Trans_logitFNR, Naive_lassoFNR),
+  Method = factor(rep(c("Pooled_Lasso", "Trans_logit", "Naive_lasso"), each = length(K_vals)))
+)
+
+# Plot
+p <- ggplot(data, aes(x = K_vals, y = Accuracy, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "green")) +
+  theme_minimal() +
+  labs(title = "Accuracy Trend by K Values", x = "K Values", y = "Accuracy")
+
+# Save the plot
+ggsave("/Users/wangzhuoyulucas/Documents/PythonGLMTrans/cleaned/accuracy_trend.pdf", plot = p, width = 8, height = 5, dpi = 600, device = "pdf")
+p
+```
+
+
+```{r}
+# Adjustments for extracting Recall (Sensitivity)
+Pooled_lasso_recall <- lapply(pooled_results, function(result) {
+  result$evaluation_metrics$recall[1]  # Change 'fnr' to 'recall' if that's the correct field
+})
+
+translogit_recall <- lapply(translogit_results, function(result) {
+  result$evaluation_metrics_valid$recall[1]  # Assuming 'recall' is under 'evaluation_metrics_valid'
+})
+
+# Convert the list of named numbers to a simple numeric vector
+Pooled_lasso_recall <- sapply(Pooled_lasso_recall, `[[`, "Sensitivity")  # Use the correct key if it's labeled as "Sensitivity"
+translogit_recall <- sapply(translogit_recall, `[[`, "Sensitivity")
+
+# Ensure that Pooled_lasso_recall and translogit_recall are numeric vectors
+# and address any potential naming discrepancies in the data extraction phase
+
+# Combine the Recall scores into a single vector and repeat the K_vals for each method
+combined_recall <- c(Pooled_lasso_recall, translogit_recall)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataRecall <- data.frame(
+  K_vals = K_vals_repeated,
+  Recall = combined_recall,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+ggplot(dataRecall, aes(x = K_vals, y = Recall, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "Recall (Sensitivity) Trend by K Values", x = "K Values", y = "Recall") +
+  theme(legend.title = element_blank())
+
+```
+# Compare Manual conversion and VGG
+```{r}
+# Combine the F1 scores into a single vector and repeat the K_vals for each method
+combined_F1V2 <- c(translogit_f1, translogit_f1V)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataF1V2 <- data.frame(
+  K_vals = K_vals_repeated,
+  F1_score = combined_F1V2,
+  Method = rep(c("ManualConversion", "VGG16"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(dataF1V2, aes(x = K_vals, y = F1_score, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("ManualConversion" = "blue", "VGG16" = "red")) +
+  theme_minimal() +
+  labs(title = "F1 Score Trend by K Values", x = "K Values", y = "F1 Score") +
+  theme(legend.title = element_blank())
+
+```
+
+
+```{r}
+# Combine the F1 scores into a single vector and repeat the K_vals for each method
+combined_acc2 <- c(translogit_ACC, translogit_ACCV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataACCV2 <- data.frame(
+  K_vals = K_vals_repeated,
+  ACC = combined_acc2,
+  Method = rep(c("ManualConversion", "VGG16"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(dataACCV2, aes(x = K_vals, y =ACC , group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("ManualConversion" = "blue", "VGG16" = "red")) +
+  theme_minimal() +
+  labs(title = "Accuracy Trend by K Values", x = "K Values", y = "Accuracy") +
+  theme(legend.title = element_blank())
+```
+
+
+
+```{r}
+# Combine the F1 scores into a single vector and repeat the K_vals for each method
+combined_fnr2 <- c(translogit_fnr, translogit_fnrV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataACCV2 <- data.frame(
+  K_vals = K_vals_repeated,
+  fnr = combined_fnr2,
+  Method = rep(c("ManualConversion", "VGG16"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(dataACCV2, aes(x = K_vals, y =fnr , group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("ManualConversion" = "blue", "VGG16" = "red")) +
+  theme_minimal() +
+  labs(title = "FNR Trend by K Values", x = "K Values", y = "FNR") +
+  theme(legend.title = element_blank())
+```
+
+
+
+
+
+```{r}
+# Combine the F1 scores into a single vector and repeat the K_vals for each method
+combined_recall2 <- c(translogit_recall, translogit_recallV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+datarecallV2 <- data.frame(
+  K_vals = K_vals_repeated,
+  recall = combined_recall2,
+  Method = rep(c("ManualConversion", "VGG16"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+library(ggplot2)
+
+ggplot(datarecallV2, aes(x = K_vals, y = recall , group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("ManualConversion" = "blue", "VGG16" = "red")) +
+  theme_minimal() +
+  labs(title = "Recall Trend by K Values", x = "K Values", y = "Recall") +
+  theme(legend.title = element_blank())
+```
+
+```{r}
+# Adjustments for extracting Recall (Sensitivity)
+Pooled_lasso_recallV <- lapply(pooled_resultsV, function(result) {
+  result$evaluation_metrics$recall[1]  # Change 'fnr' to 'recall' if that's the correct field
+})
+
+translogit_recallV <- lapply(translogit_resultsV, function(result) {
+  result$evaluation_metrics_valid$recall[1]  # Assuming 'recall' is under 'evaluation_metrics_valid'
+})
+
+# Convert the list of named numbers to a simple numeric vector
+Pooled_lasso_recallV <- sapply(Pooled_lasso_recallV, `[[`, "Sensitivity")  # Use the correct key if it's labeled as "Sensitivity"
+translogit_recallV <- sapply(translogit_recallV, `[[`, "Sensitivity")
+
+# Ensure that Pooled_lasso_recall and translogit_recall are numeric vectors
+# and address any potential naming discrepancies in the data extraction phase
+
+# Combine the Recall scores into a single vector and repeat the K_vals for each method
+combined_recallV <- c(Pooled_lasso_recallV, translogit_recallV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataRecallV <- data.frame(
+  K_vals = K_vals_repeated,
+  Recall = combined_recallV,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+ggplot(dataRecallV, aes(x = K_vals, y = Recall, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "Recall (Sensitivity) Trend by K Values", x = "K Values", y = "Recall") +
+  theme(legend.title = element_blank())
+
+```
+```{r}
+# Adjustments for extracting Recall (Sensitivity)
+Pooled_lasso_ACCV <- lapply(pooled_resultsV, function(result) {
+  result$evaluation_metrics$accuracy[1]  # Change 'fnr' to 'recall' if that's the correct field
+})
+
+translogit_ACCV <- lapply(translogit_resultsV, function(result) {
+  result$evaluation_metrics_valid$accuracy[1]  # Assuming 'recall' is under 'evaluation_metrics_valid'
+})
+
+# Convert the list of named numbers to a simple numeric vector
+Pooled_lasso_ACCV <- sapply(Pooled_lasso_ACCV, `[[`, "Accuracy")  # Use the correct key if it's labeled as "Sensitivity"
+translogit_ACCV <- sapply(translogit_ACCV, `[[`, "Accuracy")
+
+# Ensure that Pooled_lasso_recall and translogit_recall are numeric vectors
+# and address any potential naming discrepancies in the data extraction phase
+
+# Combine the Recall scores into a single vector and repeat the K_vals for each method
+combined_ACCV <- c(Pooled_lasso_ACCV, translogit_ACCV)
+K_vals_repeated <- rep(K_vals, times = 2)
+
+# Create a data frame for plotting
+dataACCV <- data.frame(
+  K_vals = K_vals_repeated,
+  Recall = combined_ACCV,
+  Method = rep(c("Pooled_Lasso", "Trans_logit"), each = length(K_vals))
+)
+
+# Plot with ggplot2
+ggplot(dataACCV, aes(x = K_vals, y = Recall, group = Method, color = Method, shape = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Pooled_Lasso" = "blue", "Trans_logit" = "red")) +
+  theme_minimal() +
+  labs(title = "Accuracy Trend by K Values", x = "K Values", y = "Aaccuracy") +
+  theme(legend.title = element_blank())
+```
+
+# PLOT TRANS LOGIT AND AH With the loaded RData SubmissionBrainImage.RData
+## known sources:
+```{r}
+library(ggplot2)
+
+# Define a function to plot a metric
+plot_metric <- function(data, metric_name) {
+  ggplot(data, aes(x = as.factor(K), y = get(metric_name), color = as.factor(h_value))) +
+    geom_line(aes(group = as.factor(h_value))) +
+    geom_point() +
+    facet_wrap(~h_value, scales = "free_y") +
+    labs(title = paste(metric_name, "by K for Different h_values"),
+         x = "K", y = metric_name) +
+    theme_linedraw()+
+    theme(legend.position = "none") # Hide the legend if it's not needed
+}
+
+# Assuming results_df is your combined results data frame
+# Plot each metric and save the plot
+
+# Plot Accuracy
+accuracy_plot <- plot_metric(results_df, "accuracy")
+ggsave("accuracy_plot.png", accuracy_plot, width = 10, height = 8, dpi = 1200)
+
+# Plot L1 Error
+l1_error_plot <- plot_metric(results_df, "l1_error")
+ggsave("l1_error_plot.png", l1_error_plot, width = 10, height = 8, dpi = 1200)
+
+# Plot FNR
+fnr_plot <- plot_metric(results_df, "fnr")
+ggsave("fnr_plot.png", fnr_plot, width = 10, height = 8, dpi = 1200)
+
+# Plot Precision
+precision_plot <- plot_metric(results_df, "precision")
+ggsave("precision_plot.png", precision_plot, width = 10, height = 8, dpi = 1200)
+
+# Plot F1 Score
+f1_score_plot <- plot_metric(results_df, "f1_score")
+ggsave("f1_score_plot.png", f1_score_plot, width = 10, height = 8, dpi = 1200)
+
+# Display one of the plots in the RStudio Viewer
+print(accuracy_plot) # for example
+
+```
+
+
+```{r}
+results_tl_total <- read.csv('/Users/wangzhuoyulucas/Documents/PythonGLMTrans/archive/results_known_tl.csv')
+results_tl_total$h_value <- rep(c(10,20,30,40,50), each = 10)
+```
+
+```{r}
+# Plotting Baseline vs. Transfer Learning Accuracy
+ggplot(results_tl_total, aes(x = ID, shape = factor(h_value))) +
+  geom_line(aes(y = Baseline_Accuracy, color = "Baseline Accuracy", group = h_value, color = h_value)) +
+  geom_line(aes(y = TL_Accuracy, color = "Transfer Learning Accuracy", group = h_value, color = h_value)) +
+  geom_point(aes(y = Baseline_Accuracy, color = "Baseline Accuracy", group = h_value, color = h_value)) +
+  geom_point(aes(y = TL_Accuracy, color = "Transfer Learning Accuracy", group = h_value, color = h_value)) +
+  scale_color_manual(values = c("Baseline Accuracy" = "blue", "Transfer Learning Accuracy" = "red")) +
+  labs(title = "Baseline vs. Transfer Learning Accuracy", x = "K", y = "Accuracy") +
+  theme_minimal()
+
+```
+```{r}
+ggplot(results_tl_total, aes(x = ID, shape = factor(h_value))) +
+  geom_line(aes(y = Baseline_l2, color = "Baseline", group = h_value, color = h_value)) +
+  geom_line(aes(y = TL_l2, color = "Transfer Learning", group = h_value, color = h_value)) +
+  geom_point(aes(y = Baseline_l2, color = "Baseline", group = h_value, color = h_value)) +
+  geom_point(aes(y = TL_l2, color = "Transfer Learning", group = h_value, color = h_value)) +
+  scale_color_manual(values = c("Baseline" = "blue", "Transfer Learning" = "red")) +
+  labs(title = "Baseline vs. Transfer Learning l2 Estimation error", x = "K", y = "l2 Loss") +
+  theme_minimal()
+
+```
+
+```{r}
+library(ggplot2)
+
+# Assuming results_tl_total is your dataframe and it has columns ID, h_value, Baseline_l2, TL_l2
+ggplot(results_tl_total, aes(x = ID)) +
+  geom_line(aes(y = Baseline_l2, color = "Baseline", group = interaction(h_value, "Baseline")), linetype="solid") +
+  geom_line(aes(y = TL_l2, color = "Transfer Learning", group = interaction(h_value, "TL")), linetype="dashed") +
+  geom_point(aes(y = Baseline_l2, color = "Baseline", shape = factor(h_value))) +
+  geom_point(aes(y = TL_l2, color = "Transfer Learning", shape = factor(h_value))) +
+  scale_color_manual(values = c("Baseline" = "blue", "Transfer Learning" = "red")) +
+  labs(title = "Baseline vs. Transfer Learning L2 Estimation Error", x = "K", y = "L2 Loss") +
+  facet_wrap(~ h_value, scales = "free_x")  # Create separate plots for each h_value
+
+```
+
+```{r}
+
+# Assuming results_tl_total is your dataframe and it has columns ID, h_value, Baseline_l2, TL_l2
+ggplot(results_tl_total, aes(x = ID)) +
+  geom_line(aes(y = Baseline_F1, color = "Baseline", group = interaction(h_value, "Baseline")), linetype="solid") +
+  geom_line(aes(y = TL_F1, color = "Transfer Learning", group = interaction(h_value, "TL")), linetype="dashed") +
+  geom_point(aes(y = Baseline_F1, color = "Baseline", shape = factor(h_value))) +
+  geom_point(aes(y = TL_F1, color = "Transfer Learning", shape = factor(h_value))) +
+  scale_color_manual(values = c("Baseline" = "blue", "Transfer Learning" = "red")) +
+  labs(title = "Baseline vs. Transfer Learning F1 Score", x = "K", y = "F1 Score") +
+  facet_wrap(~ h_value, scales = "free_x")  # Create separate plots for each h_value
+
+
+```
+```{r}
+
+# Assuming results_tl_total is your dataframe and it has columns ID, h_value, Baseline_l2, TL_l2
+ggplot(results_tl_total, aes(x = ID)) +
+  geom_line(aes(y = Baseline_Recall, color = "Baseline", group = interaction(h_value, "Baseline")), linetype="solid") +
+  geom_line(aes(y = TL_l2, color = "Transfer Learning", group = interaction(h_value, "TL")), linetype="dashed") +
+  geom_point(aes(y = Baseline_l2, color = "Baseline", shape = factor(h_value))) +
+  geom_point(aes(y = TL_l2, color = "Transfer Learning", shape = factor(h_value))) +
+  scale_color_manual(values = c("Baseline" = "blue", "Transfer Learning" = "red")) +
+  labs(title = "Baseline vs. Transfer Learning L2 Estimation Error", x = "K", y = "L2 Loss") +
+  facet_wrap(~ h_value, scales = "free_x")  # Create separate plots for each h_value
+
+```
+
 
 
 
